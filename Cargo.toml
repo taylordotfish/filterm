@@ -1,0 +1,10 @@
+[package]
+name = "filterm"
+version = "0.1.0"
+edition = "2018"
+
+[features]
+panic = []
+
+[dependencies]
+nix = "0.23"
