@@ -1,8 +1,8 @@
 use std::cell::Cell;
-use std::convert::TryFrom;
+use std::convert::{Infallible, TryFrom};
 use std::ffi::{CString, OsString};
-use std::fmt::Display;
 use std::mem::MaybeUninit;
+use std::ops::ControlFlow;
 use std::os::raw::c_int;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -26,30 +26,16 @@ use nix::NixPath;
 mod cfmakeraw;
 use cfmakeraw::cfmakeraw;
 
-fn expect<T, E: Display>(r: Result<T, E>, msg: impl Display) -> T {
-    match r {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("error: {}: {}", msg, e);
-            if cfg!(feature = "panic") {
-                panic!("{}: {}", msg, e);
-            } else {
-                exit(1);
-            }
-        }
-    }
-}
-
-fn get_winsize(fd: RawFd) -> nix::Result<libc::winsize> {
-    nix::ioctl_read_bad!(tiocgwinsz, libc::TIOCGWINSZ, libc::winsize);
+fn tiocgwinsz(fd: RawFd) -> nix::Result<libc::winsize> {
+    nix::ioctl_read_bad!(ioctl, libc::TIOCGWINSZ, libc::winsize);
     let mut size = MaybeUninit::uninit();
-    unsafe { tiocgwinsz(fd, size.as_mut_ptr()) }?;
+    unsafe { ioctl(fd, size.as_mut_ptr()) }?;
     Ok(unsafe { size.assume_init() })
 }
 
-fn set_winsize(fd: RawFd, size: &libc::winsize) -> nix::Result<()> {
-    nix::ioctl_write_ptr_bad!(tiocswinsz, libc::TIOCSWINSZ, libc::winsize);
-    unsafe { tiocswinsz(fd, size as *const _) }.map(|_| ())
+fn tiocswinsz(fd: RawFd, size: &libc::winsize) -> nix::Result<()> {
+    nix::ioctl_write_ptr_bad!(ioctl, libc::TIOCSWINSZ, libc::winsize);
+    unsafe { ioctl(fd, size as *const _) }.map(|_| ())
 }
 
 thread_local! {
@@ -57,7 +43,7 @@ thread_local! {
     static CHILD_PID: Cell<Option<Pid>> = Cell::new(None);
 }
 
-fn install_exit_handler() {
+fn install_exit_handler() -> Result<(), Error> {
     extern "C" fn handle_exit() {
         ORIG_TERM_ATTRS.with(|attrs| {
             if let Some(attrs) = attrs.take() {
@@ -67,12 +53,16 @@ fn install_exit_handler() {
     }
 
     if unsafe { libc::atexit(handle_exit) } != 0 {
-        eprintln!("error: could not register exit handler");
-        exit(1);
+        return Err(Error {
+            kind: ExitHandlerSetupFailed,
+            call: Some("atexit".into()),
+            errno: None,
+        });
     }
+    Ok(())
 }
 
-fn install_terminate_handler() {
+fn install_terminate_handler() -> Result<(), Error> {
     const SIGNALS: [Signal; 3] =
         [Signal::SIGHUP, Signal::SIGINT, Signal::SIGTERM];
 
@@ -92,8 +82,10 @@ fn install_terminate_handler() {
     );
 
     for signal in SIGNALS {
-        expect(unsafe { sigaction(signal, &action) }, "sigaction()");
+        unsafe { sigaction(signal, &action) }
+            .map_err(SignalSetupFailed.with("sigaction"))?;
     }
+    Ok(())
 }
 
 fn child_exec<Arg, Path>(
@@ -101,20 +93,18 @@ fn child_exec<Arg, Path>(
     tty_name: &Path,
     attrs: &Termios,
     winsize: &libc::winsize,
-) -> !
+) -> Result<Infallible, Error>
 where
     Arg: Into<OsString>,
     Path: NixPath + ?Sized,
 {
-    expect(setsid(), "setsid()");
+    setsid().map_err(ChildSetupFailed.with("setsid"))?;
     for fd in 0..=2 {
         let _ = close(fd);
     }
 
-    let tty_fd = expect(
-        open(tty_name, OFlag::O_RDWR, Mode::empty()),
-        "could not open tty",
-    );
+    let tty_fd = open(tty_name, OFlag::O_RDWR, Mode::empty())
+        .map_err(ChildOpenTtyFailed.with("open"))?;
 
     for fd in 0..=2 {
         let _ = dup2(tty_fd, fd);
@@ -124,17 +114,26 @@ where
         let _ = close(tty_fd);
     }
 
-    expect(
-        tcsetattr(0, SetArg::TCSANOW, attrs),
-        "could not set child tty attrs",
-    );
-    expect(set_winsize(0, winsize), "could not set child tty size");
+    tcsetattr(0, SetArg::TCSANOW, attrs).map_err(
+        SetAttrFailed {
+            target: Child,
+            caller: Child,
+        }
+        .with("tcsetattr"),
+    )?;
+    tiocswinsz(0, winsize).map_err(
+        SetSizeFailed {
+            target: Child,
+            caller: Child,
+        }
+        .with(Ioctl("TIOCSWINSZ")),
+    )?;
 
     let args: Vec<_> = args
         .into_iter()
         .map(|a| CString::new(a.into().into_vec()).unwrap())
         .collect();
-    expect(execvp(&args[0], &args), "execvp()");
+    execvp(&args[0], &args).map_err(ChildExecFailed.with("execvp"))?;
     unreachable!();
 }
 
@@ -147,58 +146,61 @@ fn handle_stdin_ready<Fh: FilterHooks, const N: usize>(
     pty: &PtyMaster,
     filter: &mut Fh,
     bufs: &mut Buffers<N>,
-) {
+) -> Result<ControlFlow<()>, Error> {
     let nread = match read(0, &mut bufs.input) {
         Ok(0) => {
-            eprintln!("error: unexpected empty read from parent terminal");
-            exit(1);
+            return Err(Error {
+                kind: EmptyParentRead,
+                call: Some("read".into()),
+                errno: None,
+            });
         }
-        r => expect(r, "could not read from parent terminal"),
+        r => r.map_err(ParentReadFailed.with("read"))?,
     };
 
     let inbuf = &bufs.input;
+    let mut write_err = false;
     chunked(
         &mut bufs.output,
         |c| filter.on_parent_data(&inbuf[..nread], |data| c.add(data)),
         |chunk| {
-            if write(pty.as_raw_fd(), chunk).is_err() {
-                exit(0);
+            if !write_err && write(pty.as_raw_fd(), chunk).is_err() {
+                write_err = true;
             }
         },
     );
+
+    Ok(if write_err {
+        ControlFlow::Break(())
+    } else {
+        ControlFlow::Continue(())
+    })
 }
 
 fn handle_pty_ready<Fh: FilterHooks, const N: usize>(
     pty: &PtyMaster,
     filter: &mut Fh,
     bufs: &mut Buffers<N>,
-) {
+) -> Result<ControlFlow<()>, Error> {
     let nread = match read(pty.as_raw_fd(), &mut bufs.input) {
-        Ok(0) | Err(_) => {
-            exit(CHILD_PID.with(|pid| match pid.get() {
-                Some(pid) => {
-                    let status = waitpid(pid, None);
-                    let status = expect(status, "waitpid()");
-                    if let WaitStatus::Exited(_, code) = status {
-                        code
-                    } else {
-                        0
-                    }
-                }
-                None => 0,
-            }));
-        }
+        Ok(0) | Err(_) => return Ok(ControlFlow::Break(())),
         Ok(n) => n,
     };
 
     let inbuf = &bufs.input;
+    let mut write_err = None;
     chunked(
         &mut bufs.output,
         |c| filter.on_child_data(&inbuf[..nread], |data| c.add(data)),
         |chunk| {
-            expect(write(0, chunk), "could not write to parent terminal");
+            if write_err.is_none() {
+                write_err = write(0, chunk).err();
+            }
         },
     );
+    write_err
+        .map(ParentWriteFailed.with("write"))
+        .map_or(Ok(ControlFlow::Continue(())), Err)
 }
 
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
@@ -207,89 +209,200 @@ extern "C" fn handle_sigwinch(_: c_int) {
     SIGWINCH_RECEIVED.store(true, Ordering::Relaxed);
 }
 
-fn update_child_winsize(pty: &PtyMaster) {
+fn update_child_winsize(pty: &PtyMaster) -> Result<(), Error> {
     if !SIGWINCH_RECEIVED.swap(false, Ordering::Relaxed) {
-        return;
+        return Ok(());
     }
-    let size = expect(get_winsize(0), "could not get terminal size");
-    expect(
-        set_winsize(pty.as_raw_fd(), &size),
-        "could not set child tty size",
-    );
+
+    let size = tiocgwinsz(0).map_err(GetSizeFailed.with("tiocgwinsz"))?;
+    tiocswinsz(pty.as_raw_fd(), &size).map_err(
+        SetSizeFailed {
+            target: Child,
+            caller: Parent,
+        }
+        .with(Ioctl("TIOCSWINSZ")),
+    )?;
+    Ok(())
 }
 
-pub fn run<Arg, Fh>(args: impl IntoIterator<Item = Arg>, filter: &mut Fh) -> !
+pub struct Error {
+    pub kind: ErrorKind,
+    pub call: Option<CallName>,
+    pub errno: Option<Errno>,
+}
+
+#[derive(Clone, Copy)]
+pub enum Client {
+    Parent,
+    Child,
+}
+
+use Client::*;
+
+#[non_exhaustive]
+pub enum ErrorKind {
+    #[non_exhaustive]
+    NotATty,
+    #[non_exhaustive]
+    GetAttrFailed,
+    #[non_exhaustive]
+    SetAttrFailed {
+        target: Client,
+        caller: Client,
+    },
+    #[non_exhaustive]
+    GetSizeFailed,
+    #[non_exhaustive]
+    SetSizeFailed {
+        target: Client,
+        caller: Client,
+    },
+    #[non_exhaustive]
+    CreatePtyFailed,
+    #[non_exhaustive]
+    CreateChildFailed,
+    #[non_exhaustive]
+    SignalSetupFailed,
+    #[non_exhaustive]
+    ExitHandlerSetupFailed,
+    #[non_exhaustive]
+    ChildCommFailed,
+    #[non_exhaustive]
+    ChildSetupFailed,
+    #[non_exhaustive]
+    ChildOpenTtyFailed,
+    #[non_exhaustive]
+    ChildExecFailed,
+    #[non_exhaustive]
+    EmptyParentRead,
+    #[non_exhaustive]
+    ParentReadFailed,
+    #[non_exhaustive]
+    ParentWriteFailed,
+    #[non_exhaustive]
+    GetChildStatusFailed,
+    UnexpectedChildStatus(UnexpectedChildStatus),
+}
+
+use ErrorKind::*;
+pub struct UnexpectedChildStatus(WaitStatus);
+
+impl ErrorKind {
+    fn with(self, name: impl Into<CallName>) -> impl FnOnce(Errno) -> Error {
+        let name = name.into();
+        |errno| Error {
+            kind: self,
+            call: Some(name),
+            errno: Some(errno),
+        }
+    }
+}
+
+impl Error {
+    fn with_kind(kind: impl Into<ErrorKind>) -> Self {
+        Self {
+            kind: kind.into(),
+            call: None,
+            errno: None,
+        }
+    }
+}
+
+pub enum CallName {
+    Func(&'static str),
+    Ioctl(&'static str),
+}
+
+use CallName::Ioctl;
+
+impl From<&'static str> for CallName {
+    fn from(func: &'static str) -> Self {
+        Self::Func(func)
+    }
+}
+
+// TODO: Need to make sure signal/exit handlers and signal masks are cleaned up
+// when this function returns.
+
+pub fn run<Arg, Fh>(
+    args: impl IntoIterator<Item = Arg>,
+    filter: &mut Fh,
+) -> Result<i32, Error>
 where
     Arg: Into<OsString>,
     Fh: FilterHooks,
 {
     if !isatty(0).unwrap_or(false) {
-        eprintln!("error: stdin is not a tty");
-        exit(1);
+        return Err(Error::with_kind(NotATty));
     }
 
-    install_exit_handler();
-    let term_attrs = expect(tcgetattr(0), "tcgetattr(0)");
-    let winsize = expect(get_winsize(0), "could not get terminal size");
-    let pty = expect(
-        posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY),
-        "posix_openpt()",
-    );
+    install_exit_handler()?;
+    let term_attrs = tcgetattr(0).map_err(GetAttrFailed.with("tcgetattr"))?;
+    let winsize =
+        tiocgwinsz(0).map_err(GetSizeFailed.with(Ioctl("TIOCGWINSZ")))?;
+    let pty = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY)
+        .map_err(CreatePtyFailed.with("posix_openpt"))?;
 
-    expect(grantpt(&pty), "grantpt()");
-    expect(unlockpt(&pty), "unlockpt()");
-    let child_tty_name = expect(unsafe { ptsname(&pty) }, "ptsname()");
+    grantpt(&pty).map_err(CreatePtyFailed.with("grantpt"))?;
+    unlockpt(&pty).map_err(CreatePtyFailed.with("unlockpt"))?;
+    let child_tty_name =
+        unsafe { ptsname(&pty) }.map_err(CreatePtyFailed.with("ptsname"))?;
 
     let mut new_attrs = term_attrs.clone();
     cfmakeraw(&mut new_attrs);
-    expect(tcsetattr(0, SetArg::TCSANOW, &new_attrs), "tcsetattr(0)");
+    tcsetattr(0, SetArg::TCSANOW, &new_attrs).map_err(
+        SetAttrFailed {
+            target: Parent,
+            caller: Parent,
+        }
+        .with("tcsetattr"),
+    )?;
 
     ORIG_TERM_ATTRS.with(|attrs| {
         attrs.set(Some(term_attrs.clone()));
     });
 
-    install_terminate_handler();
-    match expect(unsafe { fork() }, "fork()") {
+    install_terminate_handler()?;
+    let child_pid = match {
+        unsafe { fork() }.map_err(CreateChildFailed.with("fork"))?
+    } {
         ForkResult::Child => {
             drop(pty);
-            child_exec(args, child_tty_name.as_str(), &term_attrs, &winsize);
+            child_exec(args, child_tty_name.as_str(), &term_attrs, &winsize)?;
+            unreachable!();
         }
         ForkResult::Parent {
             child,
-        } => {
-            CHILD_PID.with(|pid| {
-                pid.set(Some(child));
-            });
-        }
-    }
+        } => child,
+    };
+
+    CHILD_PID.with(|pid| {
+        pid.set(Some(child_pid));
+    });
 
     let mut orig_sigmask = SigSet::empty();
-    expect(
-        sigprocmask(
-            SigmaskHow::SIG_BLOCK,
-            Some(&{
-                let mut set = SigSet::empty();
-                set.add(Signal::SIGWINCH);
-                set
-            }),
-            Some(&mut orig_sigmask),
-        ),
-        "sigprocmask()",
-    );
+    sigprocmask(
+        SigmaskHow::SIG_BLOCK,
+        Some(&{
+            let mut set = SigSet::empty();
+            set.add(Signal::SIGWINCH);
+            set
+        }),
+        Some(&mut orig_sigmask),
+    )
+    .map_err(SignalSetupFailed.with("sigprocmask"))?;
 
-    expect(
-        unsafe {
-            sigaction(
-                Signal::SIGWINCH,
-                &SigAction::new(
-                    SigHandler::Handler(handle_sigwinch),
-                    SaFlags::SA_RESTART,
-                    SigSet::empty(),
-                ),
-            )
-        },
-        "sigaction()",
-    );
+    unsafe {
+        sigaction(
+            Signal::SIGWINCH,
+            &SigAction::new(
+                SigHandler::Handler(handle_sigwinch),
+                SaFlags::SA_RESTART,
+                SigSet::empty(),
+            ),
+        )
+    }
+    .map_err(SignalSetupFailed.with("sigaction"))?;
 
     let pty_fd = pty.as_raw_fd();
     // As of nix v0.23.0, `FdSet::insert` and `FdSet::remove` cause UB if
@@ -309,21 +422,43 @@ where
 
         match pselect(pty_fd + 1, &mut fds, None, None, None, &orig_sigmask) {
             Err(Errno::EINTR) => {
-                update_child_winsize(&pty);
+                update_child_winsize(&pty)?;
                 continue;
             }
             r => {
-                expect(r, "pselect()");
+                r.map_err(ChildCommFailed.with("pselect"))?;
             }
         }
 
         if fds.contains(0) {
-            handle_stdin_ready(&pty, filter, &mut bufs);
+            if let ControlFlow::Break(_) =
+                handle_stdin_ready(&pty, filter, &mut bufs)?
+            {
+                break;
+            }
         }
 
         if fds.contains(pty_fd) {
-            handle_pty_ready(&pty, filter, &mut bufs);
+            if let ControlFlow::Break(_) =
+                handle_pty_ready(&pty, filter, &mut bufs)?
+            {
+                break;
+            }
         }
+    }
+
+    let status = waitpid(child_pid, None)
+        .map_err(GetChildStatusFailed.with("waitpid"))?;
+    if let WaitStatus::Exited(_, code) = status {
+        Ok(code)
+    } else {
+        Err(Error {
+            kind: ErrorKind::UnexpectedChildStatus(UnexpectedChildStatus(
+                status,
+            )),
+            call: Some("waitpid".into()),
+            errno: None,
+        })
     }
 }
 
