@@ -9,6 +9,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub use nix;
 use nix::errno::Errno;
 use nix::fcntl::{open, OFlag};
 use nix::libc;
@@ -225,6 +226,7 @@ fn update_child_winsize(pty: &PtyMaster) -> Result<(), Error> {
     Ok(())
 }
 
+#[non_exhaustive]
 pub struct Error {
     pub kind: ErrorKind,
     pub call: Option<CallName>,
@@ -281,11 +283,11 @@ pub enum ErrorKind {
     ParentWriteFailed,
     #[non_exhaustive]
     GetChildStatusFailed,
-    UnexpectedChildStatus(UnexpectedChildStatus),
+    #[non_exhaustive]
+    UnexpectedChildStatus(WaitStatus),
 }
 
 use ErrorKind::*;
-pub struct UnexpectedChildStatus(WaitStatus);
 
 impl ErrorKind {
     fn with(self, name: impl Into<CallName>) -> impl FnOnce(Errno) -> Error {
@@ -453,9 +455,7 @@ where
         Ok(code)
     } else {
         Err(Error {
-            kind: ErrorKind::UnexpectedChildStatus(UnexpectedChildStatus(
-                status,
-            )),
+            kind: ErrorKind::UnexpectedChildStatus(status),
             call: Some("waitpid".into()),
             errno: None,
         })
