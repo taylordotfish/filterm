@@ -1,6 +1,26 @@
+/*
+ * Copyright (C) 2021 taylor.fish <contact@taylor.fish>
+ *
+ * This file is part of Filterm.
+ *
+ * Filterm is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * Filterm is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with Filterm. If not, see <https://www.gnu.org/licenses/>.
+ */
+
 use std::cell::Cell;
 use std::convert::{Infallible, TryFrom};
 use std::ffi::{CString, OsString};
+use std::fmt::{self, Display, Formatter};
 use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
 use std::os::raw::c_int;
@@ -40,40 +60,23 @@ fn tiocswinsz(fd: RawFd, size: &libc::winsize) -> nix::Result<()> {
 }
 
 thread_local! {
-    static ORIG_TERM_ATTRS: Cell<Option<Termios>> = Cell::new(None);
-    static CHILD_PID: Cell<Option<Pid>> = Cell::new(None);
+    static ORIG_TERM_ATTRS: Cell<Option<Termios>> = Cell::default();
+    static CHILD_PID: Cell<Option<Pid>> = Cell::default();
+    static ORIG_TERMINATE_ACTIONS: Cell<Option<[SigAction; 3]>> =
+        Cell::default();
+    static ORIG_SIGWINCH_ACTION: Cell<Option<SigAction>> = Cell::default();
+    static ORIG_SIGMASK: Cell<Option<SigSet>> = Cell::default();
 }
 
-fn install_exit_handler() -> Result<(), Error> {
-    extern "C" fn handle_exit() {
-        ORIG_TERM_ATTRS.with(|attrs| {
-            if let Some(attrs) = attrs.take() {
-                let _ = tcsetattr(0, SetArg::TCSANOW, &attrs);
-            }
-        });
-    }
-
-    if unsafe { libc::atexit(handle_exit) } != 0 {
-        return Err(Error {
-            kind: ExitHandlerSetupFailed,
-            call: Some("atexit".into()),
-            errno: None,
-        });
-    }
-    Ok(())
-}
+const TERMINATE_SIGNALS: [Signal; 3] =
+    [Signal::SIGHUP, Signal::SIGINT, Signal::SIGTERM];
 
 fn install_terminate_handler() -> Result<(), Error> {
-    const SIGNALS: [Signal; 3] =
-        [Signal::SIGHUP, Signal::SIGINT, Signal::SIGTERM];
-
-    extern "C" fn handle_terminate(_: c_int) {
-        CHILD_PID.with(|pid| {
-            if let Some(pid) = pid.take() {
-                let _ = kill(pid, Signal::SIGHUP);
-            }
-        });
-        exit(0);
+    extern "C" fn handle_terminate(signal: c_int) {
+        if let Some(pid) = CHILD_PID.with(|pid| pid.take()) {
+            let _ = kill(pid, Signal::SIGHUP);
+        }
+        exit(-signal);
     }
 
     let action = SigAction::new(
@@ -82,10 +85,15 @@ fn install_terminate_handler() -> Result<(), Error> {
         SigSet::empty(),
     );
 
-    for signal in SIGNALS {
-        unsafe { sigaction(signal, &action) }
-            .map_err(SignalSetupFailed.with("sigaction"))?;
+    let mut orig = [None; 3];
+    for (i, signal) in TERMINATE_SIGNALS.iter().copied().enumerate() {
+        orig[i] = Some(
+            unsafe { sigaction(signal, &action) }
+                .map_err(SignalSetupFailed.with("sigaction"))?,
+        );
     }
+    ORIG_TERMINATE_ACTIONS
+        .with(|actions| actions.set(Some(orig.map(|s| s.unwrap()))));
     Ok(())
 }
 
@@ -226,14 +234,7 @@ fn update_child_winsize(pty: &PtyMaster) -> Result<(), Error> {
     Ok(())
 }
 
-#[non_exhaustive]
-pub struct Error {
-    pub kind: ErrorKind,
-    pub call: Option<CallName>,
-    pub errno: Option<Errno>,
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Client {
     Parent,
     Child,
@@ -241,7 +242,17 @@ pub enum Client {
 
 use Client::*;
 
+impl Display for Client {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parent => write!(f, "parent"),
+            Self::Child => write!(f, "child"),
+        }
+    }
+}
+
 #[non_exhaustive]
+#[derive(Debug)]
 pub enum ErrorKind {
     #[non_exhaustive]
     NotATty,
@@ -265,8 +276,6 @@ pub enum ErrorKind {
     CreateChildFailed,
     #[non_exhaustive]
     SignalSetupFailed,
-    #[non_exhaustive]
-    ExitHandlerSetupFailed,
     #[non_exhaustive]
     ChildCommFailed,
     #[non_exhaustive]
@@ -300,6 +309,96 @@ impl ErrorKind {
     }
 }
 
+impl Display for ErrorKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            NotATty => write!(f, "stdin is not a TTY"),
+            GetAttrFailed => write!(f, "could not get terminal attributes"),
+            SetAttrFailed {
+                target,
+                caller,
+            } => {
+                write!(f, "could not set {} terminal attributes", target)?;
+                if target != caller {
+                    write!(f, " from {}", caller)?;
+                }
+                Ok(())
+            }
+            GetSizeFailed => write!(f, "could not get terminal size"),
+            SetSizeFailed {
+                target,
+                caller,
+            } => {
+                write!(f, "could not set {} terminal size", target)?;
+                if target != caller {
+                    write!(f, " from {}", caller)?;
+                }
+                Ok(())
+            }
+            CreatePtyFailed => write!(f, "could not create pseudoterminal"),
+            CreateChildFailed => write!(f, "could not create child process"),
+            SignalSetupFailed => write!(f, "could not configure signals"),
+            ChildCommFailed => {
+                write!(f, "could not communicate with child process")
+            }
+            ChildSetupFailed => write!(f, "could not set up child process"),
+            ChildOpenTtyFailed => {
+                write!(f, "could not open terminal in child process")
+            }
+            ChildExecFailed => write!(f, "could not execute command"),
+            EmptyParentRead => {
+                write!(f, "unexpected empty read from parent terminal")
+            }
+            ParentReadFailed => {
+                write!(f, "could not read from parent terminal")
+            }
+            ParentWriteFailed => {
+                write!(f, "could not write to parent terminal")
+            }
+            GetChildStatusFailed => {
+                write!(f, "could not get status of child process")
+            }
+            UnexpectedChildStatus(status) => {
+                write!(f, "got unexpected child process status: {:?}", status)
+            }
+        }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum CallName {
+    #[non_exhaustive]
+    Func(&'static str),
+    #[non_exhaustive]
+    Ioctl(&'static str),
+}
+
+use CallName::Ioctl;
+
+impl Display for CallName {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Func(name) => write!(f, "{}()", name),
+            Self::Ioctl(name) => write!(f, "ioctl {}", name),
+        }
+    }
+}
+
+impl From<&'static str> for CallName {
+    fn from(func: &'static str) -> Self {
+        Self::Func(func)
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct Error {
+    pub kind: ErrorKind,
+    pub call: Option<CallName>,
+    pub errno: Option<Errno>,
+}
+
 impl Error {
     fn with_kind(kind: impl Into<ErrorKind>) -> Self {
         Self {
@@ -310,35 +409,34 @@ impl Error {
     }
 }
 
-pub enum CallName {
-    Func(&'static str),
-    Ioctl(&'static str),
-}
-
-use CallName::Ioctl;
-
-impl From<&'static str> for CallName {
-    fn from(func: &'static str) -> Self {
-        Self::Func(func)
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.kind)?;
+        match (&self.call, self.errno) {
+            (Some(call), Some(e)) => {
+                write!(f, " ({} returned {})", call, e)
+            }
+            (Some(call), None) => {
+                write!(f, " (from {})", call)
+            }
+            (None, Some(e)) => {
+                write!(f, " (got {})", e)
+            }
+            (None, None) => Ok(()),
+        }
     }
 }
 
-// TODO: Need to make sure signal/exit handlers and signal masks are cleaned up
-// when this function returns.
+impl std::error::Error for Error {}
 
-pub fn run<Arg, Fh>(
-    args: impl IntoIterator<Item = Arg>,
-    filter: &mut Fh,
-) -> Result<i32, Error>
-where
-    Arg: Into<OsString>,
-    Fh: FilterHooks,
-{
+fn run_impl(
+    args: impl IntoIterator<Item = OsString>,
+    filter: &mut impl FilterHooks,
+) -> Result<i32, Error> {
     if !isatty(0).unwrap_or(false) {
         return Err(Error::with_kind(NotATty));
     }
 
-    install_exit_handler()?;
     let term_attrs = tcgetattr(0).map_err(GetAttrFailed.with("tcgetattr"))?;
     let winsize =
         tiocgwinsz(0).map_err(GetSizeFailed.with(Ioctl("TIOCGWINSZ")))?;
@@ -359,10 +457,7 @@ where
         }
         .with("tcsetattr"),
     )?;
-
-    ORIG_TERM_ATTRS.with(|attrs| {
-        attrs.set(Some(term_attrs.clone()));
-    });
+    ORIG_TERM_ATTRS.with(|attrs| attrs.set(Some(term_attrs.clone())));
 
     install_terminate_handler()?;
     let child_pid = match {
@@ -377,10 +472,7 @@ where
             child,
         } => child,
     };
-
-    CHILD_PID.with(|pid| {
-        pid.set(Some(child_pid));
-    });
+    CHILD_PID.with(|pid| pid.set(Some(child_pid)));
 
     let mut orig_sigmask = SigSet::empty();
     sigprocmask(
@@ -393,8 +485,9 @@ where
         Some(&mut orig_sigmask),
     )
     .map_err(SignalSetupFailed.with("sigprocmask"))?;
+    ORIG_SIGMASK.with(|mask| mask.set(Some(orig_sigmask)));
 
-    unsafe {
+    let orig_sigwinch = unsafe {
         sigaction(
             Signal::SIGWINCH,
             &SigAction::new(
@@ -405,6 +498,7 @@ where
         )
     }
     .map_err(SignalSetupFailed.with("sigaction"))?;
+    ORIG_SIGWINCH_ACTION.with(|act| act.set(Some(orig_sigwinch)));
 
     let pty_fd = pty.as_raw_fd();
     // As of nix v0.23.0, `FdSet::insert` and `FdSet::remove` cause UB if
@@ -452,6 +546,7 @@ where
     let status = waitpid(child_pid, None)
         .map_err(GetChildStatusFailed.with("waitpid"))?;
     if let WaitStatus::Exited(_, code) = status {
+        CHILD_PID.with(|pid| pid.take());
         Ok(code)
     } else {
         Err(Error {
@@ -460,6 +555,33 @@ where
             errno: None,
         })
     }
+}
+
+pub fn run<Args, Arg, Fh>(args: Args, filter: &mut Fh) -> Result<i32, Error>
+where
+    Args: IntoIterator<Item = Arg>,
+    Arg: Into<OsString>,
+    Fh: FilterHooks,
+{
+    let result = run_impl(args.into_iter().map(|a| a.into()), filter);
+    if let Some(attrs) = ORIG_TERM_ATTRS.with(|attrs| attrs.take()) {
+        let _ = tcsetattr(0, SetArg::TCSANOW, &attrs);
+    }
+    if let Some(mask) = ORIG_SIGMASK.with(|mask| mask.take()) {
+        let _ = sigprocmask(SigmaskHow::SIG_SETMASK, Some(&mask), None);
+    }
+    if let Some(actions) = ORIG_TERMINATE_ACTIONS.with(|a| a.take()) {
+        for (action, signal) in actions.iter().zip(TERMINATE_SIGNALS) {
+            let _ = unsafe { sigaction(signal, action) };
+        }
+    }
+    if let Some(action) = ORIG_SIGWINCH_ACTION.with(|a| a.take()) {
+        let _ = unsafe { sigaction(Signal::SIGWINCH, &action) };
+    }
+    if let Some(pid) = CHILD_PID.with(|pid| pid.take()) {
+        let _ = kill(pid, Signal::SIGHUP);
+    }
+    result
 }
 
 pub trait FilterHooks {
