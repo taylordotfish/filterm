@@ -429,6 +429,82 @@ impl Display for Error {
 
 impl std::error::Error for Error {}
 
+pub trait FilterHooks {
+    fn on_child_data<F>(&mut self, data: &[u8], mut parent_write: F)
+    where
+        F: FnMut(&[u8]),
+    {
+        parent_write(data);
+    }
+
+    fn on_parent_data<F>(&mut self, data: &[u8], mut child_write: F)
+    where
+        F: FnMut(&[u8]),
+    {
+        child_write(data);
+    }
+}
+
+pub struct DefaultFilterHooks;
+
+impl FilterHooks for DefaultFilterHooks {}
+
+/// For use with [`chunked`]; see its documentation for more information.
+struct Chunked<'a, T, OutFn> {
+    buf: &'a mut Vec<T>,
+    chunk_out: OutFn,
+}
+
+impl<'a, T, OutFn> Chunked<'a, T, OutFn>
+where
+    T: Copy,
+    OutFn: FnMut(&[T]),
+{
+    /// For use with [`chunked`]; see its documentation for more information.
+    pub fn add(&mut self, mut data: &[T]) {
+        assert!(self.buf.capacity() > 0);
+        loop {
+            let spare = self.buf.capacity() - self.buf.len();
+            if data.len() <= spare {
+                self.buf.extend(data.iter().copied());
+                if self.buf.capacity() == self.buf.len() {
+                    self.flush();
+                }
+                return;
+            }
+            self.buf.extend(data.iter().copied().take(spare));
+            self.flush();
+            data = &data[spare..];
+        }
+    }
+
+    fn flush(&mut self) {
+        let mut buf = core::mem::take(self.buf);
+        (self.chunk_out)(&buf);
+        buf.clear();
+        *self.buf = buf;
+    }
+}
+
+/// Given a function, `data_in`, that repeatedly calls [`Chunked::add`] with
+/// pieces of data, this function groups the data into chunks using the
+/// provided buffer `buf` and calls `chunk_out` with each chunk.
+fn chunked<T, In, Out>(buf: &mut Vec<T>, data_in: In, chunk_out: Out)
+where
+    T: Copy,
+    In: FnOnce(&mut Chunked<'_, T, Out>),
+    Out: FnMut(&[T]),
+{
+    let mut chunked = Chunked {
+        buf,
+        chunk_out,
+    };
+    data_in(&mut chunked);
+    if !chunked.buf.is_empty() {
+        chunked.flush();
+    }
+}
+
 fn run_impl(
     args: impl IntoIterator<Item = OsString>,
     filter: &mut impl FilterHooks,
@@ -582,80 +658,4 @@ where
         let _ = kill(pid, Signal::SIGHUP);
     }
     result
-}
-
-pub trait FilterHooks {
-    fn on_child_data<F>(&mut self, data: &[u8], mut parent_write: F)
-    where
-        F: FnMut(&[u8]),
-    {
-        parent_write(data);
-    }
-
-    fn on_parent_data<F>(&mut self, data: &[u8], mut child_write: F)
-    where
-        F: FnMut(&[u8]),
-    {
-        child_write(data);
-    }
-}
-
-pub struct DefaultFilterHooks;
-
-impl FilterHooks for DefaultFilterHooks {}
-
-/// For use with [`chunked`]; see its documentation for more information.
-struct Chunked<'a, T, OutFn> {
-    buf: &'a mut Vec<T>,
-    chunk_out: OutFn,
-}
-
-impl<'a, T, OutFn> Chunked<'a, T, OutFn>
-where
-    T: Copy,
-    OutFn: FnMut(&[T]),
-{
-    /// For use with [`chunked`]; see its documentation for more information.
-    pub fn add(&mut self, mut data: &[T]) {
-        assert!(self.buf.capacity() > 0);
-        loop {
-            let spare = self.buf.capacity() - self.buf.len();
-            if data.len() <= spare {
-                self.buf.extend(data.iter().copied());
-                if self.buf.capacity() == self.buf.len() {
-                    self.flush();
-                }
-                return;
-            }
-            self.buf.extend(data.iter().copied().take(spare));
-            self.flush();
-            data = &data[spare..];
-        }
-    }
-
-    fn flush(&mut self) {
-        let mut buf = core::mem::take(self.buf);
-        (self.chunk_out)(&buf);
-        buf.clear();
-        *self.buf = buf;
-    }
-}
-
-/// Given a function, `data_in`, that repeatedly calls [`Chunked::add`] with
-/// pieces of data, this function groups the data into chunks using the
-/// provided buffer `buf` and calls `chunk_out` with each chunk.
-fn chunked<T, In, Out>(buf: &mut Vec<T>, data_in: In, chunk_out: Out)
-where
-    T: Copy,
-    In: FnOnce(&mut Chunked<'_, T, Out>),
-    Out: FnMut(&[T]),
-{
-    let mut chunked = Chunked {
-        buf,
-        chunk_out,
-    };
-    data_in(&mut chunked);
-    if !chunked.buf.is_empty() {
-        chunked.flush();
-    }
 }
