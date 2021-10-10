@@ -682,11 +682,10 @@ where
         static HAS_RUN_ON_THIS_THREAD: Cell<bool> = Cell::new(false);
     }
 
-    if HAS_RUN.swap(true, Ordering::Relaxed) {
-        if !HAS_RUN_ON_THIS_THREAD.with(|b| b.get()) {
+    if !HAS_RUN_ON_THIS_THREAD.with(|b| b.get()) {
+        if HAS_RUN.swap(true, Ordering::Relaxed) {
             panic!("`run` may not be called from multiple threads");
         }
-    } else {
         HAS_RUN_ON_THIS_THREAD.with(|b| b.set(true));
     }
 
