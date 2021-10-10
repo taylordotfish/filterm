@@ -213,7 +213,7 @@ fn handle_pty_ready<Fh: FilterHooks, const N: usize>(
         .map_or(Ok(ControlFlow::Continue(())), Err)
 }
 
-pub fn try_child_wait(pid: Pid) -> Result<Option<i32>, Error> {
+fn try_child_wait(pid: Pid) -> Result<Option<i32>, Error> {
     if !SIGCHLD_RECEIVED.swap(false, Ordering::Relaxed) {
         return Ok(None);
     }
