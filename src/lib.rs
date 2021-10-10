@@ -39,7 +39,7 @@ use nix::sys::signal::{kill, sigprocmask, SigSet, SigmaskHow, Signal};
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler};
 use nix::sys::stat::Mode;
 use nix::sys::termios::{tcgetattr, tcsetattr, SetArg, Termios};
-use nix::sys::wait::{waitpid, WaitStatus};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{close, dup2, execvp, fork, isatty, read, setsid, write};
 use nix::unistd::{ForkResult, Pid};
 use nix::NixPath;
@@ -65,6 +65,7 @@ thread_local! {
     static ORIG_TERMINATE_ACTIONS: Cell<Option<[SigAction; 3]>> =
         Cell::default();
     static ORIG_SIGWINCH_ACTION: Cell<Option<SigAction>> = Cell::default();
+    static ORIG_SIGCHLD_ACTION: Cell<Option<SigAction>> = Cell::default();
     static ORIG_SIGMASK: Cell<Option<SigSet>> = Cell::default();
 }
 
@@ -212,6 +213,23 @@ fn handle_pty_ready<Fh: FilterHooks, const N: usize>(
         .map_or(Ok(ControlFlow::Continue(())), Err)
 }
 
+pub fn try_child_wait(pid: Pid) -> Result<Option<i32>, Error> {
+    if !SIGCHLD_RECEIVED.swap(false, Ordering::Relaxed) {
+        return Ok(None);
+    }
+    match waitpid(pid, Some(WaitPidFlag::WNOHANG))
+        .map_err(GetChildStatusFailed.with("waitpid"))?
+    {
+        WaitStatus::Exited(_, code) => Ok(Some(code)),
+        WaitStatus::StillAlive => Ok(None),
+        status => Err(Error {
+            kind: ErrorKind::UnexpectedChildStatus(status),
+            call: Some("waitpid".into()),
+            errno: None,
+        }),
+    }
+}
+
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigwinch(_: c_int) {
@@ -232,6 +250,12 @@ fn update_child_winsize(pty: &PtyMaster) -> Result<(), Error> {
         .with(Ioctl("TIOCSWINSZ")),
     )?;
     Ok(())
+}
+
+static SIGCHLD_RECEIVED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_sigchld(_: c_int) {
+    SIGCHLD_RECEIVED.store(true, Ordering::Relaxed);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -576,6 +600,19 @@ fn run_impl(
     .map_err(SignalSetupFailed.with("sigaction"))?;
     ORIG_SIGWINCH_ACTION.with(|act| act.set(Some(orig_sigwinch)));
 
+    let orig_sigchld = unsafe {
+        sigaction(
+            Signal::SIGCHLD,
+            &SigAction::new(
+                SigHandler::Handler(handle_sigchld),
+                SaFlags::SA_RESTART,
+                SigSet::empty(),
+            ),
+        )
+    }
+    .map_err(SignalSetupFailed.with("sigaction"))?;
+    ORIG_SIGCHLD_ACTION.with(|act| act.set(Some(orig_sigchld)));
+
     let pty_fd = pty.as_raw_fd();
     // As of nix v0.23.0, `FdSet::insert` and `FdSet::remove` cause UB if
     // passed a file descriptor greater than or equal to `libc::FD_SETSIZE`.
@@ -595,6 +632,9 @@ fn run_impl(
         match pselect(pty_fd + 1, &mut fds, None, None, None, &orig_sigmask) {
             Err(Errno::EINTR) => {
                 update_child_winsize(&pty)?;
+                if let Some(code) = try_child_wait(child_pid)? {
+                    return Ok(code);
+                }
                 continue;
             }
             r => {
@@ -619,17 +659,15 @@ fn run_impl(
         }
     }
 
-    let status = waitpid(child_pid, None)
-        .map_err(GetChildStatusFailed.with("waitpid"))?;
-    if let WaitStatus::Exited(_, code) = status {
-        CHILD_PID.with(|pid| pid.take());
-        Ok(code)
-    } else {
-        Err(Error {
+    match waitpid(child_pid, None)
+        .map_err(GetChildStatusFailed.with("waitpid"))?
+    {
+        WaitStatus::Exited(_, code) => Ok(code),
+        status => Err(Error {
             kind: ErrorKind::UnexpectedChildStatus(status),
             call: Some("waitpid".into()),
             errno: None,
-        })
+        }),
     }
 }
 
@@ -653,6 +691,9 @@ where
     }
     if let Some(action) = ORIG_SIGWINCH_ACTION.with(|a| a.take()) {
         let _ = unsafe { sigaction(Signal::SIGWINCH, &action) };
+    }
+    if let Some(action) = ORIG_SIGCHLD_ACTION.with(|a| a.take()) {
+        let _ = unsafe { sigaction(Signal::SIGCHLD, &action) };
     }
     if let Some(pid) = CHILD_PID.with(|pid| pid.take()) {
         let _ = kill(pid, Signal::SIGHUP);
