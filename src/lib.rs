@@ -677,6 +677,19 @@ where
     Arg: Into<OsString>,
     Fh: FilterHooks,
 {
+    static HAS_RUN: AtomicBool = AtomicBool::new(false);
+    thread_local! {
+        static HAS_RUN_ON_THIS_THREAD: Cell<bool> = Cell::new(false);
+    }
+
+    if HAS_RUN.swap(true, Ordering::Relaxed) {
+        if !HAS_RUN_ON_THIS_THREAD.with(|b| b.get()) {
+            panic!("`run` may not be called from multiple threads");
+        }
+    } else {
+        HAS_RUN_ON_THIS_THREAD.with(|b| b.set(true));
+    }
+
     let result = run_impl(args.into_iter().map(|a| a.into()), filter);
     if let Some(attrs) = ORIG_TERM_ATTRS.with(|attrs| attrs.take()) {
         let _ = tcsetattr(0, SetArg::TCSANOW, &attrs);
