@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 pub use nix;
 use nix::errno::Errno;
-use nix::fcntl::{open, OFlag};
+use nix::fcntl::{fcntl, open, FcntlArg, FdFlag, OFlag};
 use nix::libc;
 use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt, PtyMaster};
 use nix::sys::select::{pselect, FdSet};
@@ -40,13 +40,16 @@ use nix::sys::stat::Mode;
 use nix::sys::termios::{tcgetattr, tcsetattr, SetArg, Termios};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{close, dup2, execvp, fork, isatty, read, setsid, write};
-use nix::unistd::{ForkResult, Pid};
+use nix::unistd::{pipe, ForkResult, Pid};
 use nix::NixPath;
 
-#[macro_use]
-mod ignore_error;
 mod cfmakeraw;
 use cfmakeraw::cfmakeraw;
+#[macro_use]
+mod ignore_error;
+#[allow(dead_code)]
+mod owned_fd;
+use owned_fd::OwnedFd;
 
 fn tiocgwinsz(fd: RawFd) -> nix::Result<libc::winsize> {
     nix::ioctl_read_bad!(ioctl, libc::TIOCGWINSZ, libc::winsize);
@@ -101,23 +104,91 @@ fn install_terminate_handler() -> Result<(), Error> {
     Ok(())
 }
 
+#[repr(u32)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ChildErrorKind {
+    Setsid = 1,
+    OpenTty = 2,
+    Tcsetattr = 3,
+    Tiocswinsz = 4,
+    Execvp = 5,
+}
+
+struct ChildError(ChildErrorKind, Errno);
+
+impl From<ChildError> for Error {
+    fn from(e: ChildError) -> Self {
+        use ChildErrorKind as C;
+        Self {
+            kind: match e.0 {
+                C::Setsid => ChildSetupFailed,
+                C::OpenTty => ChildOpenTtyFailed,
+                C::Tcsetattr => SetAttrFailed {
+                    target: Child,
+                    caller: Child,
+                },
+                C::Tiocswinsz => SetSizeFailed {
+                    target: Child,
+                    caller: Child,
+                },
+                C::Execvp => ChildExecFailed,
+            },
+            call: Some(match e.0 {
+                C::Setsid => "setsid".into(),
+                C::OpenTty => "open".into(),
+                C::Tcsetattr => "tcsetattr".into(),
+                C::Tiocswinsz => Ioctl("TIOCSWINSZ"),
+                C::Execvp => "execvp".into(),
+            }),
+            errno: Some(e.1),
+        }
+    }
+}
+
+impl From<ChildError> for u64 {
+    fn from(e: ChildError) -> Self {
+        ((e.0 as u32 as u64) << 32) | (e.1 as i32 as u32 as u64)
+    }
+}
+
+impl TryFrom<u64> for ChildError {
+    type Error = u64;
+
+    fn try_from(n: u64) -> Result<Self, Self::Error> {
+        use ChildErrorKind::*;
+        let errno = Errno::from_i32(n as u32 as i32);
+        let kind = match (n >> 32) as u32 {
+            1 => Setsid,
+            2 => OpenTty,
+            3 => Tcsetattr,
+            4 => Tiocswinsz,
+            5 => Execvp,
+            _ => return Err(n),
+        };
+        Ok(ChildError(kind, errno))
+    }
+}
+
 fn child_exec<Arg, Path>(
     args: impl IntoIterator<Item = Arg>,
     tty_name: &Path,
     attrs: &Termios,
     winsize: &libc::winsize,
-) -> Result<Infallible, Error>
+) -> Result<Infallible, ChildError>
 where
     Arg: Into<OsString>,
     Path: NixPath + ?Sized,
 {
-    setsid().map_err(ChildSetupFailed.with("setsid"))?;
+    use ChildError as Error;
+    use ChildErrorKind::*;
+
+    setsid().map_err(|e| Error(Setsid, e))?;
     for fd in 0..=2 {
         let _ = close(fd);
     }
 
     let tty_fd = open(tty_name, OFlag::O_RDWR, Mode::empty())
-        .map_err(ChildOpenTtyFailed.with("open"))?;
+        .map_err(|e| Error(OpenTty, e))?;
 
     for fd in 0..=2 {
         let _ = dup2(tty_fd, fd);
@@ -127,26 +198,14 @@ where
         let _ = close(tty_fd);
     }
 
-    tcsetattr(0, SetArg::TCSANOW, attrs).map_err(
-        SetAttrFailed {
-            target: Child,
-            caller: Child,
-        }
-        .with("tcsetattr"),
-    )?;
-    tiocswinsz(0, winsize).map_err(
-        SetSizeFailed {
-            target: Child,
-            caller: Child,
-        }
-        .with(Ioctl("TIOCSWINSZ")),
-    )?;
+    tcsetattr(0, SetArg::TCSANOW, attrs).map_err(|e| Error(Tcsetattr, e))?;
+    tiocswinsz(0, winsize).map_err(|e| Error(Tiocswinsz, e))?;
 
     let args: Vec<_> = args
         .into_iter()
         .map(|a| CString::new(a.into().into_vec()).unwrap())
         .collect();
-    execvp(&args[0], &args).map_err(ChildExecFailed.with("execvp"))?;
+    execvp(&args[0], &args).map_err(|e| Error(Execvp, e))?;
     unreachable!();
 }
 
@@ -538,6 +597,24 @@ where
     }
 }
 
+fn read_child_error(fd: RawFd) -> Result<Option<ChildError>, Error> {
+    let mut buf = [0_u8; 8];
+    let mut nread = 0;
+    while nread < buf.len() {
+        nread += match read(fd, &mut buf[nread..])
+            .map_err(ChildCommFailed.with("read"))?
+        {
+            0 => return Ok(None),
+            n => n,
+        }
+    }
+    let n = u64::from_be_bytes(buf);
+    Ok(Some(
+        ChildError::try_from(n)
+            .expect("received invalid error from child process"),
+    ))
+}
+
 #[non_exhaustive]
 pub enum ExitKind {
     Normal(i32),
@@ -576,19 +653,38 @@ where
     ORIG_TERM_ATTRS.with(|attrs| attrs.set(Some(term_attrs.clone())));
 
     install_terminate_handler()?;
-    let child_pid = match {
-        unsafe { fork() }.map_err(CreateChildFailed.with("fork"))?
-    } {
+    let (read_fd, write_fd) = pipe().expect("TODO");
+    let [read_fd, write_fd] = [read_fd, write_fd].map(OwnedFd::new);
+    let fork = unsafe { fork() }.map_err(CreateChildFailed.with("fork"))?;
+    let child_pid = match fork {
         ForkResult::Child => {
             drop(pty);
-            child_exec(args, child_tty_name.as_str(), &term_attrs, &winsize)?;
-            unreachable!();
+            ignore_error!(read_fd.close());
+            ignore_error!(fcntl(
+                write_fd.get(),
+                FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)
+            ));
+            let e = child_exec(
+                args,
+                child_tty_name.as_str(),
+                &term_attrs,
+                &winsize,
+            )
+            .unwrap_err();
+            ignore_error!(write(write_fd.get(), &u64::from(e).to_be_bytes()));
+            std::process::exit(1);
         }
         ForkResult::Parent {
             child,
         } => child,
     };
+
     CHILD_PID.with(|pid| pid.set(Some(child_pid)));
+    ignore_error!(write_fd.close());
+    if let Some(e) = read_child_error(read_fd.get())? {
+        return Err(Error::from(e));
+    }
+    ignore_error!(read_fd.close());
 
     let mut orig_sigmask = SigSet::empty();
     sigprocmask(
