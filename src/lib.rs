@@ -209,6 +209,24 @@ where
     unreachable!();
 }
 
+fn read_child_error(fd: RawFd) -> Result<Option<ChildError>, Error> {
+    let mut buf = [0_u8; 8];
+    let mut nread = 0;
+    while nread < buf.len() {
+        nread += match read(fd, &mut buf[nread..])
+            .map_err(ChildCommFailed.with("read"))?
+        {
+            0 => return Ok(None),
+            n => n,
+        }
+    }
+    let n = u64::from_be_bytes(buf);
+    Ok(Some(
+        ChildError::try_from(n)
+            .expect("received invalid error from child process"),
+    ))
+}
+
 struct Buffers<const N: usize> {
     pub input: [u8; N],
     pub output: Vec<u8>,
@@ -236,8 +254,8 @@ fn handle_stdin_ready<Fh: FilterHooks, const N: usize>(
         &mut bufs.output,
         |c| filter.on_parent_data(&inbuf[..nread], |data| c.add(data)),
         |chunk| {
-            if !write_err && write(pty.as_raw_fd(), chunk).is_err() {
-                write_err = true;
+            if !write_err {
+                write_err = write(pty.as_raw_fd(), chunk).is_err();
             }
         },
     );
@@ -595,24 +613,6 @@ where
     if !chunked.buf.is_empty() {
         chunked.flush();
     }
-}
-
-fn read_child_error(fd: RawFd) -> Result<Option<ChildError>, Error> {
-    let mut buf = [0_u8; 8];
-    let mut nread = 0;
-    while nread < buf.len() {
-        nread += match read(fd, &mut buf[nread..])
-            .map_err(ChildCommFailed.with("read"))?
-        {
-            0 => return Ok(None),
-            n => n,
-        }
-    }
-    let n = u64::from_be_bytes(buf);
-    Ok(Some(
-        ChildError::try_from(n)
-            .expect("received invalid error from child process"),
-    ))
 }
 
 #[non_exhaustive]
