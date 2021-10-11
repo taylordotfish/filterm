@@ -49,8 +49,9 @@ mod error;
 mod owned_fd;
 
 use cfmakeraw::cfmakeraw;
-use error::{CallName::Ioctl, Client::*, Error, ErrorKind::*};
+pub use error::{CallName, Client, Error, ErrorKind};
 use owned_fd::OwnedFd;
+use {CallName::Ioctl, Client::*, ErrorKind::*};
 
 fn tiocgwinsz(fd: RawFd) -> nix::Result<libc::winsize> {
     nix::ioctl_read_bad!(ioctl, libc::TIOCGWINSZ, libc::winsize);
@@ -313,15 +314,15 @@ fn handle_pty_ready<Fh: FilterHooks, const N: usize>(
         .map_or(Ok(ControlFlow::Continue(())), Err)
 }
 
-fn try_child_wait(pid: Pid) -> Result<Option<ExitKind>, Error> {
+fn try_child_wait(pid: Pid) -> Result<Option<Exit>, Error> {
     if !SIGCHLD_RECEIVED.swap(false, Ordering::Relaxed) {
         return Ok(None);
     }
     match waitpid(pid, Some(WaitPidFlag::WNOHANG))
         .map_err(GetChildStatusFailed.with("waitpid"))?
     {
-        WaitStatus::Exited(_, code) => Ok(Some(ExitKind::Normal(code))),
-        WaitStatus::Signaled(_, sig, _) => Ok(Some(ExitKind::Signal(sig))),
+        WaitStatus::Exited(_, code) => Ok(Some(Exit::Normal(code))),
+        WaitStatus::Signaled(_, sig, _) => Ok(Some(Exit::Signal(sig))),
         WaitStatus::StillAlive => Ok(None),
         status => Err(Error {
             kind: UnexpectedChildStatus(status),
@@ -436,12 +437,12 @@ where
 }
 
 #[non_exhaustive]
-pub enum ExitKind {
+pub enum Exit {
     Normal(i32),
     Signal(Signal),
 }
 
-fn run_impl<Args, Fh>(args: Args, filter: &mut Fh) -> Result<ExitKind, Error>
+fn run_impl<Args, Fh>(args: Args, filter: &mut Fh) -> Result<Exit, Error>
 where
     Args: IntoIterator<Item = OsString>,
     Fh: FilterHooks,
@@ -600,8 +601,8 @@ where
     match waitpid(child_pid, None)
         .map_err(GetChildStatusFailed.with("waitpid"))?
     {
-        WaitStatus::Exited(_, code) => Ok(ExitKind::Normal(code)),
-        WaitStatus::Signaled(_, sig, _) => Ok(ExitKind::Signal(sig)),
+        WaitStatus::Exited(_, code) => Ok(Exit::Normal(code)),
+        WaitStatus::Signaled(_, sig, _) => Ok(Exit::Signal(sig)),
         status => Err(Error {
             kind: UnexpectedChildStatus(status),
             call: Some("waitpid".into()),
@@ -610,10 +611,7 @@ where
     }
 }
 
-pub fn run<Args, Arg, Fh>(
-    args: Args,
-    filter: &mut Fh,
-) -> Result<ExitKind, Error>
+pub fn run<Args, Arg, Fh>(args: Args, filter: &mut Fh) -> Result<Exit, Error>
 where
     Args: IntoIterator<Item = Arg>,
     Arg: Into<OsString>,

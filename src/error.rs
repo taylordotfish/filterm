@@ -23,6 +23,7 @@ use nix::sys::wait::WaitStatus;
 use std::fmt::{self, Display, Formatter};
 use std::os::unix::io::RawFd;
 
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Client {
     Parent,
