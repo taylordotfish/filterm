@@ -80,7 +80,7 @@ fn install_terminate_handler() -> Result<(), Error> {
         #[allow(clippy::useless_conversion)]
         let signal = i32::try_from(signal).unwrap();
         assert!(signal != i32::MIN);
-        PENDING_SIGNAL.store(signal as _, Ordering::Relaxed);
+        PENDING_SIGNAL.store(signal, Ordering::Relaxed);
     }
 
     let action = SigAction::new(
