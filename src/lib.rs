@@ -26,8 +26,7 @@ use std::ops::ControlFlow;
 use std::os::raw::c_int;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::process::exit;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 pub use nix;
 use nix::errno::Errno;
@@ -35,7 +34,7 @@ use nix::fcntl::{open, OFlag};
 use nix::libc;
 use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt, PtyMaster};
 use nix::sys::select::{pselect, FdSet};
-use nix::sys::signal::{kill, sigprocmask, SigSet, SigmaskHow, Signal};
+use nix::sys::signal::{kill, raise, sigprocmask, SigSet, SigmaskHow, Signal};
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler};
 use nix::sys::stat::Mode;
 use nix::sys::termios::{tcgetattr, tcsetattr, SetArg, Termios};
@@ -44,6 +43,8 @@ use nix::unistd::{close, dup2, execvp, fork, isatty, read, setsid, write};
 use nix::unistd::{ForkResult, Pid};
 use nix::NixPath;
 
+#[macro_use]
+mod ignore_error;
 mod cfmakeraw;
 use cfmakeraw::cfmakeraw;
 
@@ -72,12 +73,14 @@ thread_local! {
 const TERMINATE_SIGNALS: [Signal; 3] =
     [Signal::SIGHUP, Signal::SIGINT, Signal::SIGTERM];
 
+static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(i32::MIN);
+
 fn install_terminate_handler() -> Result<(), Error> {
     extern "C" fn handle_terminate(signal: c_int) {
-        if let Some(pid) = CHILD_PID.with(|pid| pid.take()) {
-            let _ = kill(pid, Signal::SIGHUP);
-        }
-        exit(-signal);
+        #[allow(clippy::useless_conversion)]
+        let signal = i32::try_from(signal).unwrap();
+        assert!(signal != i32::MIN);
+        PENDING_SIGNAL.store(signal as _, Ordering::Relaxed);
     }
 
     let action = SigAction::new(
@@ -213,14 +216,15 @@ fn handle_pty_ready<Fh: FilterHooks, const N: usize>(
         .map_or(Ok(ControlFlow::Continue(())), Err)
 }
 
-fn try_child_wait(pid: Pid) -> Result<Option<i32>, Error> {
+fn try_child_wait(pid: Pid) -> Result<Option<ExitKind>, Error> {
     if !SIGCHLD_RECEIVED.swap(false, Ordering::Relaxed) {
         return Ok(None);
     }
     match waitpid(pid, Some(WaitPidFlag::WNOHANG))
         .map_err(GetChildStatusFailed.with("waitpid"))?
     {
-        WaitStatus::Exited(_, code) => Ok(Some(code)),
+        WaitStatus::Exited(_, code) => Ok(Some(ExitKind::Normal(code))),
+        WaitStatus::Signaled(_, sig, _) => Ok(Some(ExitKind::Signal(sig))),
         WaitStatus::StillAlive => Ok(None),
         status => Err(Error {
             kind: ErrorKind::UnexpectedChildStatus(status),
@@ -318,6 +322,8 @@ pub enum ErrorKind {
     GetChildStatusFailed,
     #[non_exhaustive]
     UnexpectedChildStatus(WaitStatus),
+    #[non_exhaustive]
+    ReceivedSignal(Signal),
 }
 
 use ErrorKind::*;
@@ -384,6 +390,9 @@ impl Display for ErrorKind {
             }
             UnexpectedChildStatus(status) => {
                 write!(f, "got unexpected child process status: {:?}", status)
+            }
+            ReceivedSignal(signal) => {
+                write!(f, "process received signal: {}", signal)
             }
         }
     }
@@ -529,10 +538,17 @@ where
     }
 }
 
-fn run_impl(
-    args: impl IntoIterator<Item = OsString>,
-    filter: &mut impl FilterHooks,
-) -> Result<i32, Error> {
+#[non_exhaustive]
+pub enum ExitKind {
+    Normal(i32),
+    Signal(Signal),
+}
+
+fn run_impl<Args, Fh>(args: Args, filter: &mut Fh) -> Result<ExitKind, Error>
+where
+    Args: IntoIterator<Item = OsString>,
+    Fh: FilterHooks,
+{
     if !isatty(0).unwrap_or(false) {
         return Err(Error::with_kind(NotATty));
     }
@@ -631,10 +647,18 @@ fn run_impl(
 
         match pselect(pty_fd + 1, &mut fds, None, None, None, &orig_sigmask) {
             Err(Errno::EINTR) => {
-                update_child_winsize(&pty)?;
-                if let Some(code) = try_child_wait(child_pid)? {
-                    return Ok(code);
+                if let Some(exit) = try_child_wait(child_pid)? {
+                    return Ok(exit);
                 }
+                match PENDING_SIGNAL.swap(i32::MIN, Ordering::Relaxed) {
+                    i32::MIN => {}
+                    signal => {
+                        return Err(Error::with_kind(ReceivedSignal(
+                            Signal::try_from(signal).expect("invalid signal"),
+                        )));
+                    }
+                }
+                update_child_winsize(&pty)?;
                 continue;
             }
             r => {
@@ -662,7 +686,8 @@ fn run_impl(
     match waitpid(child_pid, None)
         .map_err(GetChildStatusFailed.with("waitpid"))?
     {
-        WaitStatus::Exited(_, code) => Ok(code),
+        WaitStatus::Exited(_, code) => Ok(ExitKind::Normal(code)),
+        WaitStatus::Signaled(_, sig, _) => Ok(ExitKind::Signal(sig)),
         status => Err(Error {
             kind: ErrorKind::UnexpectedChildStatus(status),
             call: Some("waitpid".into()),
@@ -671,7 +696,10 @@ fn run_impl(
     }
 }
 
-pub fn run<Args, Arg, Fh>(args: Args, filter: &mut Fh) -> Result<i32, Error>
+pub fn run<Args, Arg, Fh>(
+    args: Args,
+    filter: &mut Fh,
+) -> Result<ExitKind, Error>
 where
     Args: IntoIterator<Item = Arg>,
     Arg: Into<OsString>,
@@ -691,24 +719,31 @@ where
 
     let result = run_impl(args.into_iter().map(|a| a.into()), filter);
     if let Some(attrs) = ORIG_TERM_ATTRS.with(|attrs| attrs.take()) {
-        let _ = tcsetattr(0, SetArg::TCSANOW, &attrs);
+        ignore_error!(tcsetattr(0, SetArg::TCSANOW, &attrs));
     }
     if let Some(mask) = ORIG_SIGMASK.with(|mask| mask.take()) {
-        let _ = sigprocmask(SigmaskHow::SIG_SETMASK, Some(&mask), None);
+        ignore_error!(sigprocmask(SigmaskHow::SIG_SETMASK, Some(&mask), None));
     }
     if let Some(actions) = ORIG_TERMINATE_ACTIONS.with(|a| a.take()) {
         for (action, signal) in actions.iter().zip(TERMINATE_SIGNALS) {
-            let _ = unsafe { sigaction(signal, action) };
+            ignore_error!(unsafe { sigaction(signal, action) });
         }
     }
     if let Some(action) = ORIG_SIGWINCH_ACTION.with(|a| a.take()) {
-        let _ = unsafe { sigaction(Signal::SIGWINCH, &action) };
+        ignore_error!(unsafe { sigaction(Signal::SIGWINCH, &action) });
     }
     if let Some(action) = ORIG_SIGCHLD_ACTION.with(|a| a.take()) {
-        let _ = unsafe { sigaction(Signal::SIGCHLD, &action) };
+        ignore_error!(unsafe { sigaction(Signal::SIGCHLD, &action) });
     }
     if let Some(pid) = CHILD_PID.with(|pid| pid.take()) {
-        let _ = kill(pid, Signal::SIGHUP);
+        if result.is_err() {
+            ignore_error!(kill(pid, Signal::SIGHUP));
+        }
+    }
+    if let Err(e) = &result {
+        if let ReceivedSignal(signal) = e.kind {
+            ignore_error!(raise(signal));
+        }
     }
     result
 }
