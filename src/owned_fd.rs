@@ -33,13 +33,11 @@ impl OwnedFd {
     }
 
     pub fn close(self) -> nix::Result<()> {
-        close(self.get())
+        close(self.release())
     }
 
     pub fn release(self) -> RawFd {
-        let fd = self.get();
-        let _ = ManuallyDrop::new(self);
-        fd
+        ManuallyDrop::new(self).get()
     }
 }
 

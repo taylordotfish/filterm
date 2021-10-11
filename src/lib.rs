@@ -20,7 +20,6 @@
 use std::cell::Cell;
 use std::convert::{Infallible, TryFrom};
 use std::ffi::{CString, OsString};
-use std::fmt::{self, Display, Formatter};
 use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
 use std::os::raw::c_int;
@@ -44,11 +43,13 @@ use nix::unistd::{pipe, ForkResult, Pid};
 use nix::NixPath;
 
 mod cfmakeraw;
-use cfmakeraw::cfmakeraw;
 #[macro_use]
-mod ignore_error;
+mod error;
 #[allow(dead_code)]
 mod owned_fd;
+
+use cfmakeraw::cfmakeraw;
+use error::{CallName::Ioctl, Client::*, Error, ErrorKind::*};
 use owned_fd::OwnedFd;
 
 fn tiocgwinsz(fd: RawFd) -> nix::Result<libc::winsize> {
@@ -66,8 +67,8 @@ fn tiocswinsz(fd: RawFd, size: &libc::winsize) -> nix::Result<()> {
 thread_local! {
     static ORIG_TERM_ATTRS: Cell<Option<Termios>> = Cell::default();
     static CHILD_PID: Cell<Option<Pid>> = Cell::default();
-    static ORIG_TERMINATE_ACTIONS: Cell<Option<[SigAction; 3]>> =
-        Cell::default();
+    static ORIG_TERMINATE_ACTIONS: [Cell<Option<SigAction>>; 3] =
+        Default::default();
     static ORIG_SIGWINCH_ACTION: Cell<Option<SigAction>> = Cell::default();
     static ORIG_SIGCHLD_ACTION: Cell<Option<SigAction>> = Cell::default();
     static ORIG_SIGMASK: Cell<Option<SigSet>> = Cell::default();
@@ -76,14 +77,14 @@ thread_local! {
 const TERMINATE_SIGNALS: [Signal; 3] =
     [Signal::SIGHUP, Signal::SIGINT, Signal::SIGTERM];
 
-static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(i32::MIN);
+static PENDING_TERMINATE: AtomicI32 = AtomicI32::new(i32::MIN);
 
 fn install_terminate_handler() -> Result<(), Error> {
     extern "C" fn handle_terminate(signal: c_int) {
         #[allow(clippy::useless_conversion)]
         let signal = i32::try_from(signal).unwrap();
         assert!(signal != i32::MIN);
-        PENDING_SIGNAL.store(signal, Ordering::Relaxed);
+        PENDING_TERMINATE.store(signal, Ordering::Relaxed);
     }
 
     let action = SigAction::new(
@@ -92,53 +93,64 @@ fn install_terminate_handler() -> Result<(), Error> {
         SigSet::empty(),
     );
 
-    let mut orig = [None; 3];
-    for (i, signal) in TERMINATE_SIGNALS.iter().copied().enumerate() {
-        orig[i] = Some(
-            unsafe { sigaction(signal, &action) }
-                .map_err(SignalSetupFailed.with("sigaction"))?,
-        );
+    ORIG_TERMINATE_ACTIONS.with(|actions| {
+        IntoIterator::into_iter(TERMINATE_SIGNALS).zip(actions).try_for_each(
+            |(signal, orig)| {
+                unsafe { sigaction(signal, &action) }
+                    .map_err(SignalSetupFailed.with("sigaction"))
+                    .map(|a| orig.set(Some(a)))
+            },
+        )
+    })
+}
+
+fn handle_pending_terminate() -> Result<(), Error> {
+    match PENDING_TERMINATE.swap(i32::MIN, Ordering::Relaxed) {
+        i32::MIN => Ok(()),
+        signal => Err(Error::with_kind(ReceivedSignal(
+            Signal::try_from(signal).expect("invalid signal"),
+        ))),
     }
-    ORIG_TERMINATE_ACTIONS
-        .with(|actions| actions.set(Some(orig.map(|s| s.unwrap()))));
-    Ok(())
 }
 
 #[repr(u32)]
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ChildErrorKind {
     Setsid = 1,
-    OpenTty = 2,
-    Tcsetattr = 3,
-    Tiocswinsz = 4,
-    Execvp = 5,
+    Sigprocmask = 2,
+    OpenTty = 3,
+    Tcsetattr = 4,
+    Tiocswinsz = 5,
+    Execvp = 6,
 }
 
 struct ChildError(ChildErrorKind, Errno);
 
 impl From<ChildError> for Error {
     fn from(e: ChildError) -> Self {
-        use ChildErrorKind as C;
+        use ChildErrorKind as Kind;
         Self {
             kind: match e.0 {
-                C::Setsid => ChildSetupFailed,
-                C::OpenTty => ChildOpenTtyFailed,
-                C::Tcsetattr => SetAttrFailed {
+                Kind::Setsid => ChildSetupFailed,
+                Kind::Sigprocmask => ChildSetupFailed,
+                Kind::OpenTty => ChildOpenTtyFailed,
+                Kind::Tcsetattr => SetAttrFailed {
                     target: Child,
                     caller: Child,
                 },
-                C::Tiocswinsz => SetSizeFailed {
+                Kind::Tiocswinsz => SetSizeFailed {
                     target: Child,
                     caller: Child,
                 },
-                C::Execvp => ChildExecFailed,
+                Kind::Execvp => ChildExecFailed,
             },
             call: Some(match e.0 {
-                C::Setsid => "setsid".into(),
-                C::OpenTty => "open".into(),
-                C::Tcsetattr => "tcsetattr".into(),
-                C::Tiocswinsz => Ioctl("TIOCSWINSZ"),
-                C::Execvp => "execvp".into(),
+                Kind::Setsid => "setsid".into(),
+                Kind::Sigprocmask => "sigprocmask".into(),
+                Kind::OpenTty => "open".into(),
+                Kind::Tcsetattr => "tcsetattr".into(),
+                Kind::Tiocswinsz => Ioctl("TIOCSWINSZ"),
+                Kind::Execvp => "execvp".into(),
             }),
             errno: Some(e.1),
         }
@@ -159,13 +171,14 @@ impl TryFrom<u64> for ChildError {
         let errno = Errno::from_i32(n as u32 as i32);
         let kind = match (n >> 32) as u32 {
             1 => Setsid,
-            2 => OpenTty,
-            3 => Tcsetattr,
-            4 => Tiocswinsz,
-            5 => Execvp,
+            2 => Sigprocmask,
+            3 => OpenTty,
+            4 => Tcsetattr,
+            5 => Tiocswinsz,
+            6 => Execvp,
             _ => return Err(n),
         };
-        Ok(ChildError(kind, errno))
+        Ok(Self(kind, errno))
     }
 }
 
@@ -181,6 +194,13 @@ where
 {
     use ChildError as Error;
     use ChildErrorKind::*;
+
+    sigprocmask(
+        SigmaskHow::SIG_SETMASK,
+        Some(&ORIG_SIGMASK.with(|mask| mask.take()).unwrap()),
+        None,
+    )
+    .map_err(|e| Error(Sigprocmask, e))?;
 
     setsid().map_err(|e| Error(Setsid, e))?;
     for fd in 0..=2 {
@@ -210,7 +230,7 @@ where
 }
 
 fn read_child_error(fd: RawFd) -> Result<Option<ChildError>, Error> {
-    let mut buf = [0_u8; 8];
+    let mut buf = [0; 8];
     let mut nread = 0;
     while nread < buf.len() {
         nread += match read(fd, &mut buf[nread..])
@@ -304,7 +324,7 @@ fn try_child_wait(pid: Pid) -> Result<Option<ExitKind>, Error> {
         WaitStatus::Signaled(_, sig, _) => Ok(Some(ExitKind::Signal(sig))),
         WaitStatus::StillAlive => Ok(None),
         status => Err(Error {
-            kind: ErrorKind::UnexpectedChildStatus(status),
+            kind: UnexpectedChildStatus(status),
             call: Some("waitpid".into()),
             errno: None,
         }),
@@ -338,206 +358,6 @@ static SIGCHLD_RECEIVED: AtomicBool = AtomicBool::new(false);
 extern "C" fn handle_sigchld(_: c_int) {
     SIGCHLD_RECEIVED.store(true, Ordering::Relaxed);
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Client {
-    Parent,
-    Child,
-}
-
-use Client::*;
-
-impl Display for Client {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Parent => write!(f, "parent"),
-            Self::Child => write!(f, "child"),
-        }
-    }
-}
-
-#[non_exhaustive]
-#[derive(Debug)]
-pub enum ErrorKind {
-    #[non_exhaustive]
-    NotATty,
-    #[non_exhaustive]
-    GetAttrFailed,
-    #[non_exhaustive]
-    SetAttrFailed {
-        target: Client,
-        caller: Client,
-    },
-    #[non_exhaustive]
-    GetSizeFailed,
-    #[non_exhaustive]
-    SetSizeFailed {
-        target: Client,
-        caller: Client,
-    },
-    #[non_exhaustive]
-    CreatePtyFailed,
-    #[non_exhaustive]
-    CreateChildFailed,
-    #[non_exhaustive]
-    SignalSetupFailed,
-    #[non_exhaustive]
-    ChildCommFailed,
-    #[non_exhaustive]
-    ChildSetupFailed,
-    #[non_exhaustive]
-    ChildOpenTtyFailed,
-    #[non_exhaustive]
-    ChildExecFailed,
-    #[non_exhaustive]
-    EmptyParentRead,
-    #[non_exhaustive]
-    ParentReadFailed,
-    #[non_exhaustive]
-    ParentWriteFailed,
-    #[non_exhaustive]
-    GetChildStatusFailed,
-    #[non_exhaustive]
-    UnexpectedChildStatus(WaitStatus),
-    #[non_exhaustive]
-    ReceivedSignal(Signal),
-}
-
-use ErrorKind::*;
-
-impl ErrorKind {
-    fn with(self, name: impl Into<CallName>) -> impl FnOnce(Errno) -> Error {
-        let name = name.into();
-        |errno| Error {
-            kind: self,
-            call: Some(name),
-            errno: Some(errno),
-        }
-    }
-}
-
-impl Display for ErrorKind {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            NotATty => write!(f, "stdin is not a TTY"),
-            GetAttrFailed => write!(f, "could not get terminal attributes"),
-            SetAttrFailed {
-                target,
-                caller,
-            } => {
-                write!(f, "could not set {} terminal attributes", target)?;
-                if target != caller {
-                    write!(f, " from {}", caller)?;
-                }
-                Ok(())
-            }
-            GetSizeFailed => write!(f, "could not get terminal size"),
-            SetSizeFailed {
-                target,
-                caller,
-            } => {
-                write!(f, "could not set {} terminal size", target)?;
-                if target != caller {
-                    write!(f, " from {}", caller)?;
-                }
-                Ok(())
-            }
-            CreatePtyFailed => write!(f, "could not create pseudoterminal"),
-            CreateChildFailed => write!(f, "could not create child process"),
-            SignalSetupFailed => write!(f, "could not configure signals"),
-            ChildCommFailed => {
-                write!(f, "could not communicate with child process")
-            }
-            ChildSetupFailed => write!(f, "could not set up child process"),
-            ChildOpenTtyFailed => {
-                write!(f, "could not open terminal in child process")
-            }
-            ChildExecFailed => write!(f, "could not execute command"),
-            EmptyParentRead => {
-                write!(f, "unexpected empty read from parent terminal")
-            }
-            ParentReadFailed => {
-                write!(f, "could not read from parent terminal")
-            }
-            ParentWriteFailed => {
-                write!(f, "could not write to parent terminal")
-            }
-            GetChildStatusFailed => {
-                write!(f, "could not get status of child process")
-            }
-            UnexpectedChildStatus(status) => {
-                write!(f, "got unexpected child process status: {:?}", status)
-            }
-            ReceivedSignal(signal) => {
-                write!(f, "process received signal: {}", signal)
-            }
-        }
-    }
-}
-
-#[non_exhaustive]
-#[derive(Debug)]
-pub enum CallName {
-    #[non_exhaustive]
-    Func(&'static str),
-    #[non_exhaustive]
-    Ioctl(&'static str),
-}
-
-use CallName::Ioctl;
-
-impl Display for CallName {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Func(name) => write!(f, "{}()", name),
-            Self::Ioctl(name) => write!(f, "ioctl {}", name),
-        }
-    }
-}
-
-impl From<&'static str> for CallName {
-    fn from(func: &'static str) -> Self {
-        Self::Func(func)
-    }
-}
-
-#[non_exhaustive]
-#[derive(Debug)]
-pub struct Error {
-    pub kind: ErrorKind,
-    pub call: Option<CallName>,
-    pub errno: Option<Errno>,
-}
-
-impl Error {
-    fn with_kind(kind: impl Into<ErrorKind>) -> Self {
-        Self {
-            kind: kind.into(),
-            call: None,
-            errno: None,
-        }
-    }
-}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.kind)?;
-        match (&self.call, self.errno) {
-            (Some(call), Some(e)) => {
-                write!(f, " ({} returned {})", call, e)
-            }
-            (Some(call), None) => {
-                write!(f, " (from {})", call)
-            }
-            (None, Some(e)) => {
-                write!(f, " (got {})", e)
-            }
-            (None, None) => Ok(()),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 pub trait FilterHooks {
     fn on_child_data<F>(&mut self, data: &[u8], mut parent_write: F)
@@ -636,10 +456,34 @@ where
     let pty = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY)
         .map_err(CreatePtyFailed.with("posix_openpt"))?;
 
+    let pty_fd = pty.as_raw_fd();
+    // As of nix v0.23.0, `FdSet::insert` and `FdSet::remove` cause UB if
+    // passed a file descriptor greater than or equal to `libc::FD_SETSIZE`,
+    // so it's important we check the file descriptor manually.
+    if !usize::try_from(pty_fd).map_or(false, |fd| fd < libc::FD_SETSIZE) {
+        return Err(Error::with_kind(BadPtyFd(pty_fd)));
+    }
+
     grantpt(&pty).map_err(CreatePtyFailed.with("grantpt"))?;
     unlockpt(&pty).map_err(CreatePtyFailed.with("unlockpt"))?;
     let child_tty_name =
         unsafe { ptsname(&pty) }.map_err(CreatePtyFailed.with("ptsname"))?;
+
+    let mut orig_sigmask = SigSet::empty();
+    sigprocmask(
+        SigmaskHow::SIG_BLOCK,
+        Some(&{
+            let mut set = SigSet::empty();
+            IntoIterator::into_iter([Signal::SIGWINCH, Signal::SIGCHLD])
+                .chain(TERMINATE_SIGNALS)
+                .for_each(|s| set.add(s));
+            set
+        }),
+        Some(&mut orig_sigmask),
+    )
+    .map_err(SignalSetupFailed.with("sigprocmask"))?;
+    ORIG_SIGMASK.with(|mask| mask.set(Some(orig_sigmask)));
+    install_terminate_handler()?;
 
     let mut new_attrs = term_attrs.clone();
     cfmakeraw(&mut new_attrs);
@@ -652,8 +496,7 @@ where
     )?;
     ORIG_TERM_ATTRS.with(|attrs| attrs.set(Some(term_attrs.clone())));
 
-    install_terminate_handler()?;
-    let (read_fd, write_fd) = pipe().expect("TODO");
+    let (read_fd, write_fd) = pipe().map_err(ChildCommFailed.with("pipe"))?;
     let [read_fd, write_fd] = [read_fd, write_fd].map(OwnedFd::new);
     let fork = unsafe { fork() }.map_err(CreateChildFailed.with("fork"))?;
     let child_pid = match fork {
@@ -686,19 +529,6 @@ where
     }
     ignore_error!(read_fd.close());
 
-    let mut orig_sigmask = SigSet::empty();
-    sigprocmask(
-        SigmaskHow::SIG_BLOCK,
-        Some(&{
-            let mut set = SigSet::empty();
-            set.add(Signal::SIGWINCH);
-            set
-        }),
-        Some(&mut orig_sigmask),
-    )
-    .map_err(SignalSetupFailed.with("sigprocmask"))?;
-    ORIG_SIGMASK.with(|mask| mask.set(Some(orig_sigmask)));
-
     let orig_sigwinch = unsafe {
         sigaction(
             Signal::SIGWINCH,
@@ -725,15 +555,10 @@ where
     .map_err(SignalSetupFailed.with("sigaction"))?;
     ORIG_SIGCHLD_ACTION.with(|act| act.set(Some(orig_sigchld)));
 
-    let pty_fd = pty.as_raw_fd();
-    // As of nix v0.23.0, `FdSet::insert` and `FdSet::remove` cause UB if
-    // passed a file descriptor greater than or equal to `libc::FD_SETSIZE`.
-    // As a workaround, we'll check `pty`'s file descriptor manually:
-    assert!(usize::try_from(pty_fd).unwrap() < libc::FD_SETSIZE);
-
+    const BUFFER_SIZE: usize = 1024;
     let mut bufs = Buffers {
-        input: [0_u8; 1024],
-        output: Vec::with_capacity(1024),
+        input: [0; BUFFER_SIZE],
+        output: Vec::with_capacity(BUFFER_SIZE),
     };
 
     loop {
@@ -743,16 +568,9 @@ where
 
         match pselect(pty_fd + 1, &mut fds, None, None, None, &orig_sigmask) {
             Err(Errno::EINTR) => {
+                handle_pending_terminate()?;
                 if let Some(exit) = try_child_wait(child_pid)? {
                     return Ok(exit);
-                }
-                match PENDING_SIGNAL.swap(i32::MIN, Ordering::Relaxed) {
-                    i32::MIN => {}
-                    signal => {
-                        return Err(Error::with_kind(ReceivedSignal(
-                            Signal::try_from(signal).expect("invalid signal"),
-                        )));
-                    }
                 }
                 update_child_winsize(&pty)?;
                 continue;
@@ -785,7 +603,7 @@ where
         WaitStatus::Exited(_, code) => Ok(ExitKind::Normal(code)),
         WaitStatus::Signaled(_, sig, _) => Ok(ExitKind::Signal(sig)),
         status => Err(Error {
-            kind: ErrorKind::UnexpectedChildStatus(status),
+            kind: UnexpectedChildStatus(status),
             call: Some("waitpid".into()),
             errno: None,
         }),
@@ -814,16 +632,13 @@ where
     }
 
     let result = run_impl(args.into_iter().map(|a| a.into()), filter);
+    if let Some(pid) = CHILD_PID.with(|pid| pid.take()) {
+        if result.is_err() {
+            ignore_error!(kill(pid, Signal::SIGHUP));
+        }
+    }
     if let Some(attrs) = ORIG_TERM_ATTRS.with(|attrs| attrs.take()) {
         ignore_error!(tcsetattr(0, SetArg::TCSANOW, &attrs));
-    }
-    if let Some(mask) = ORIG_SIGMASK.with(|mask| mask.take()) {
-        ignore_error!(sigprocmask(SigmaskHow::SIG_SETMASK, Some(&mask), None));
-    }
-    if let Some(actions) = ORIG_TERMINATE_ACTIONS.with(|a| a.take()) {
-        for (action, signal) in actions.iter().zip(TERMINATE_SIGNALS) {
-            ignore_error!(unsafe { sigaction(signal, action) });
-        }
     }
     if let Some(action) = ORIG_SIGWINCH_ACTION.with(|a| a.take()) {
         ignore_error!(unsafe { sigaction(Signal::SIGWINCH, &action) });
@@ -831,12 +646,19 @@ where
     if let Some(action) = ORIG_SIGCHLD_ACTION.with(|a| a.take()) {
         ignore_error!(unsafe { sigaction(Signal::SIGCHLD, &action) });
     }
-    if let Some(pid) = CHILD_PID.with(|pid| pid.take()) {
-        if result.is_err() {
-            ignore_error!(kill(pid, Signal::SIGHUP));
-        }
+    ORIG_TERMINATE_ACTIONS.with(|actions| {
+        actions
+            .iter()
+            .zip(TERMINATE_SIGNALS)
+            .filter_map(|(a, s)| a.take().map(|a| (a, s)))
+            .for_each(|(action, signal)| {
+                ignore_error!(unsafe { sigaction(signal, &action) });
+            });
+    });
+    if let Some(mask) = ORIG_SIGMASK.with(|mask| mask.take()) {
+        ignore_error!(sigprocmask(SigmaskHow::SIG_SETMASK, Some(&mask), None));
     }
-    if let Err(e) = &result {
+    if let Err(e) = handle_pending_terminate().as_ref().and(result.as_ref()) {
         if let ReceivedSignal(signal) = e.kind {
             ignore_error!(raise(signal));
         }
