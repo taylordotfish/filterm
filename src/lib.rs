@@ -145,14 +145,14 @@ impl From<ChildError> for Error {
                 },
                 Kind::Execvp => ChildExecFailed,
             },
-            call: Some(match e.0 {
-                Kind::Setsid => "setsid".into(),
-                Kind::Sigprocmask => "sigprocmask".into(),
-                Kind::OpenTty => "open".into(),
-                Kind::Tcsetattr => "tcsetattr".into(),
-                Kind::Tiocswinsz => Ioctl("TIOCSWINSZ"),
-                Kind::Execvp => "execvp".into(),
-            }),
+            call: match e.0 {
+                Kind::Setsid => Some("setsid".into()),
+                Kind::Sigprocmask => Some("sigprocmask".into()),
+                Kind::OpenTty => Some("open".into()),
+                Kind::Tcsetattr => Some("tcsetattr".into()),
+                Kind::Tiocswinsz => Some(Ioctl("TIOCSWINSZ")),
+                Kind::Execvp => Some("execvp".into()),
+            },
             errno: Some(e.1),
         }
     }
