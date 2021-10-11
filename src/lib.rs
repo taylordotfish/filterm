@@ -508,15 +508,15 @@ where
                 write_fd.get(),
                 FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)
             ));
-            let e = child_exec(
+            let result = child_exec(
                 args,
                 child_tty_name.as_str(),
                 &term_attrs,
                 &winsize,
-            )
-            .unwrap_err();
-            ignore_error!(write(write_fd.get(), &u64::from(e).to_be_bytes()));
-            std::process::exit(1);
+            );
+            let err = u64::from(result.unwrap_err()).to_be_bytes();
+            ignore_error!(write(write_fd.get(), &err));
+            unsafe { libc::_exit(1) };
         }
         ForkResult::Parent {
             child,
