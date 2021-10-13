@@ -314,24 +314,6 @@ fn handle_pty_ready<Fh: FilterHooks, const N: usize>(
         .map_or(Ok(ControlFlow::Continue(())), Err)
 }
 
-fn try_child_wait(pid: Pid) -> Result<Option<Exit>, Error> {
-    if !SIGCHLD_RECEIVED.swap(false, Ordering::Relaxed) {
-        return Ok(None);
-    }
-    match waitpid(pid, Some(WaitPidFlag::WNOHANG))
-        .map_err(GetChildStatusFailed.with("waitpid"))?
-    {
-        WaitStatus::Exited(_, code) => Ok(Some(Exit::Normal(code))),
-        WaitStatus::Signaled(_, sig, _) => Ok(Some(Exit::Signal(sig))),
-        WaitStatus::StillAlive => Ok(None),
-        status => Err(Error {
-            kind: UnexpectedChildStatus(status),
-            call: Some("waitpid".into()),
-            errno: None,
-        }),
-    }
-}
-
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigwinch(_: c_int) {
@@ -358,6 +340,24 @@ static SIGCHLD_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigchld(_: c_int) {
     SIGCHLD_RECEIVED.store(true, Ordering::Relaxed);
+}
+
+fn try_child_wait(pid: Pid) -> Result<Option<Exit>, Error> {
+    if !SIGCHLD_RECEIVED.swap(false, Ordering::Relaxed) {
+        return Ok(None);
+    }
+    match waitpid(pid, Some(WaitPidFlag::WNOHANG))
+        .map_err(GetChildStatusFailed.with("waitpid"))?
+    {
+        WaitStatus::Exited(_, code) => Ok(Some(Exit::Normal(code))),
+        WaitStatus::Signaled(_, sig, _) => Ok(Some(Exit::Signal(sig))),
+        WaitStatus::StillAlive => Ok(None),
+        status => Err(Error {
+            kind: UnexpectedChildStatus(status),
+            call: Some("waitpid".into()),
+            errno: None,
+        }),
+    }
 }
 
 pub trait FilterHooks {
