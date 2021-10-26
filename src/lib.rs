@@ -658,9 +658,10 @@ where
     }
 
     if !HAS_RUN_ON_THIS_THREAD.with(|b| b.get()) {
-        if HAS_RUN.swap(true, Ordering::Relaxed) {
-            panic!("`run` may not be called from multiple threads");
-        }
+        assert!(
+            !HAS_RUN.swap(true, Ordering::Relaxed),
+            "`run` may not be called from multiple threads",
+        );
         HAS_RUN_ON_THIS_THREAD.with(|b| b.set(true));
     }
 
