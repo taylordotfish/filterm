@@ -17,6 +17,13 @@
  * along with Filterm. If not, see <https://www.gnu.org/licenses/>.
  */
 
+//! Filterm lets you run a command while piping all terminal data sent to
+//! and from the child process through a custom filter. This lets you modify
+//! things like ANSI escape sequences that get sent from the child.
+//!
+//! The main way of using Filterm is to define a custom filter by implementing
+//! the [`FilterHooks`] trait, and then call [`run`].
+
 use std::cell::Cell;
 use std::convert::{Infallible, TryFrom};
 use std::ffi::{CString, OsString};
@@ -44,14 +51,14 @@ use nix::NixPath;
 
 mod cfmakeraw;
 #[macro_use]
-mod error;
+pub mod error;
 #[allow(dead_code)]
 mod owned_fd;
 
 use cfmakeraw::cfmakeraw;
-pub use error::{CallName, Client, Error, ErrorKind};
+pub use error::Error;
+use error::{CallName::Ioctl, Client::*, ErrorKind::*};
 use owned_fd::OwnedFd;
-use {CallName::Ioctl, Client::*, ErrorKind::*};
 
 fn tiocgwinsz(fd: RawFd) -> nix::Result<libc::winsize> {
     nix::ioctl_read_bad!(ioctl, libc::TIOCGWINSZ, libc::winsize);
@@ -360,7 +367,15 @@ fn try_child_wait(pid: Pid) -> Result<Option<Exit>, Error> {
     }
 }
 
+/// A trait for filtering data to and from a child terminal.
+///
+/// An object implementing this trait should be passed to [`run`].
 pub trait FilterHooks {
+    /// Called when data from the child terminal is received.
+    ///
+    /// `parent_write` should be called (any number of times) to forward this
+    /// data, or send different data, to the parent terminal. The default
+    /// implementation of this method forwards all data unchanged.
     fn on_child_data<F>(&mut self, data: &[u8], mut parent_write: F)
     where
         F: FnMut(&[u8]),
@@ -368,6 +383,11 @@ pub trait FilterHooks {
         parent_write(data);
     }
 
+    /// Called when data from the parent terminal is received.
+    ///
+    /// `child_write` should be called (any number of times) to forward this
+    /// data, or send different data, to the child terminal. The default
+    /// implementation of this method forwards all data unchanged.
     fn on_parent_data<F>(&mut self, data: &[u8], mut child_write: F)
     where
         F: FnMut(&[u8]),
@@ -376,6 +396,7 @@ pub trait FilterHooks {
     }
 }
 
+/// An implementation of [`FilterHooks`] that simply uses the default methods.
 pub struct DefaultFilterHooks;
 
 impl FilterHooks for DefaultFilterHooks {}
@@ -436,6 +457,7 @@ where
     }
 }
 
+/// Returned by [`run`] when the child process exits.
 #[non_exhaustive]
 pub enum Exit {
     Normal(i32),
@@ -611,6 +633,9 @@ where
     }
 }
 
+/// Runs the command specified by `args` with the given filter.
+///
+/// The arguments in `args` are passed to `execvp()`.
 pub fn run<Args, Arg, Fh>(args: Args, filter: &mut Fh) -> Result<Exit, Error>
 where
     Args: IntoIterator<Item = Arg>,

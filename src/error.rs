@@ -192,6 +192,7 @@ impl From<&'static str> for CallName {
     }
 }
 
+/// Returned by [`run`](crate::run) when an error occurs.
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct Error {
