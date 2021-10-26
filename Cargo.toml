@@ -2,6 +2,12 @@
 name = "filterm"
 version = "0.1.0"
 edition = "2018"
+description = "Filter terminal data to and from a child process"
+documentation = "https://docs.rs/filterm"
+readme = "misc/crate-readme.md"
+repository = "https://github.com/taylordotfish/filterm"
+license = "GPL-3.0-or-later"
+keywords = ["terminal", "filter", "unix", "linux"]
 
 [dependencies]
 nix = "0.23"
