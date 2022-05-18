@@ -1,6 +1,6 @@
 [package]
 name = "filterm"
-version = "0.1.1-dev"
+version = "0.2.0"
 edition = "2018"
 description = "Filter terminal data to and from a child process"
 documentation = "https://docs.rs/filterm"
@@ -9,5 +9,7 @@ repository = "https://github.com/taylordotfish/filterm"
 license = "GPL-3.0-or-later"
 keywords = ["terminal", "filter", "unix", "linux"]
 
-[dependencies]
-nix = "0.23"
+[dependencies.nix]
+version = "0.24"
+default-features = false
+features = ["fs", "ioctl", "poll", "process", "signal", "term"]
