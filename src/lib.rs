@@ -125,7 +125,7 @@ fn install_terminate_handler() -> Result<(), Error> {
 fn handle_pending_terminate() -> Result<(), Error> {
     match PENDING_TERMINATE.swap(i32::MIN, Ordering::Relaxed) {
         i32::MIN => Ok(()),
-        signal => Err(Error::with_kind(ReceivedSignal(
+        signal => Err(Error::from_kind(ReceivedSignal(
             Signal::try_from(signal).expect("invalid signal"),
         ))),
     }
@@ -480,7 +480,7 @@ where
     Fh: FilterHooks,
 {
     if !isatty(0).unwrap_or(false) {
-        return Err(Error::with_kind(NotATty));
+        return Err(Error::from_kind(NotATty));
     }
 
     let term_attrs = tcgetattr(0).map_err(GetAttrFailed.with("tcgetattr"))?;
@@ -490,11 +490,8 @@ where
         .map_err(CreatePtyFailed.with("posix_openpt"))?;
 
     let pty_fd = pty.as_raw_fd();
-    // As of nix v0.23.0, `FdSet::insert` and `FdSet::remove` cause UB if
-    // passed a file descriptor greater than or equal to `libc::FD_SETSIZE`,
-    // so it's important we check the file descriptor manually.
     if !usize::try_from(pty_fd).map_or(false, |fd| fd < libc::FD_SETSIZE) {
-        return Err(Error::with_kind(BadPtyFd(pty_fd)));
+        return Err(Error::from_kind(BadPtyFd(pty_fd)));
     }
 
     grantpt(&pty).map_err(CreatePtyFailed.with("grantpt"))?;

@@ -202,7 +202,7 @@ pub struct Error {
 }
 
 impl Error {
-    pub(crate) fn with_kind(kind: impl Into<ErrorKind>) -> Self {
+    pub(crate) fn from_kind(kind: impl Into<ErrorKind>) -> Self {
         Self {
             kind: kind.into(),
             call: None,
