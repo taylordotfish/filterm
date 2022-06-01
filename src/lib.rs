@@ -95,13 +95,14 @@ thread_local! {
 const TERMINATE_SIGNALS: [Signal; 3] =
     [Signal::SIGHUP, Signal::SIGINT, Signal::SIGTERM];
 
-static PENDING_TERMINATE: AtomicI32 = AtomicI32::new(i32::MIN);
+static PENDING_TERMINATE: AtomicI32 = AtomicI32::new(0);
 
 fn install_terminate_handler() -> Result<(), Error> {
     extern "C" fn handle_terminate(signal: c_int) {
-        #[allow(clippy::useless_conversion)]
-        let signal = i32::try_from(signal).unwrap();
-        assert!(signal != i32::MIN);
+        if signal == 0 {
+            let _ = write(libc::STDERR_FILENO, b"error: signal is 0\n");
+            std::process::abort();
+        }
         PENDING_TERMINATE.store(signal, Ordering::Relaxed);
     }
 
@@ -123,8 +124,8 @@ fn install_terminate_handler() -> Result<(), Error> {
 }
 
 fn handle_pending_terminate() -> Result<(), Error> {
-    match PENDING_TERMINATE.swap(i32::MIN, Ordering::Relaxed) {
-        i32::MIN => Ok(()),
+    match PENDING_TERMINATE.swap(0, Ordering::Relaxed) {
+        0 => Ok(()),
         signal => Err(Error::from_kind(ReceivedSignal(
             Signal::try_from(signal).expect("invalid signal"),
         ))),
