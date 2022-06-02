@@ -108,7 +108,7 @@ fn install_terminate_handler() -> Result<(), Error> {
 
     let action = SigAction::new(
         SigHandler::Handler(handle_terminate),
-        SaFlags::empty(),
+        SaFlags::SA_RESTART,
         SigSet::empty(),
     );
 
