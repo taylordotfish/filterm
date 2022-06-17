@@ -692,11 +692,9 @@ fn run_impl(
 /// This function behaves as if it passes `args` to `execvp()`, but it
 /// internally uses `execv()` as the former is not async-signal-safe.
 ///
-/// # Notes
+/// # Panics
 ///
-/// * This function cannot be called from multiple threads concurrently.
-/// * This function calls [`ptsname`], which is not thread-safe. Thus, you must
-///   not call [`ptsname`] while this function is running.
+/// This function will panic if called from multiple threads concurrently.
 pub fn run<Args, Arg, F>(args: Args, filter: &mut F) -> Result<Exit, Error>
 where
     Args: IntoIterator<Item = Arg>,
