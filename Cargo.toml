@@ -1,6 +1,6 @@
 [package]
 name = "filterm"
-version = "0.2.3"
+version = "0.2.4-dev"
 edition = "2018"
 description = "Filter terminal data to and from a child process"
 documentation = "https://docs.rs/filterm"
