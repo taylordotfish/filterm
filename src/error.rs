@@ -18,6 +18,7 @@
  */
 
 use nix::errno::Errno;
+use nix::poll::PollFlags;
 use nix::sys::signal::Signal;
 use nix::sys::wait::WaitStatus;
 use std::fmt::{self, Display, Formatter};
@@ -39,6 +40,32 @@ impl Display for Client {
     }
 }
 
+#[derive(Debug)]
+pub struct ChildCommFailed {
+    pub(crate) kind: ChildCommFailedKind,
+}
+
+#[derive(Debug)]
+pub(crate) enum ChildCommFailedKind {
+    Unspecified,
+    BadPollFlags(PollFlags),
+    SignalReadError,
+}
+
+impl ChildCommFailed {
+    pub(crate) fn new() -> Self {
+        ChildCommFailedKind::Unspecified.into()
+    }
+}
+
+impl From<ChildCommFailedKind> for ChildCommFailed {
+    fn from(kind: ChildCommFailedKind) -> Self {
+        Self {
+            kind,
+        }
+    }
+}
+
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum ErrorKind {
@@ -55,19 +82,21 @@ pub enum ErrorKind {
     GetSizeFailed,
     #[non_exhaustive]
     SetSizeFailed {
+        #[doc(hidden)]
+        #[deprecated = "this is always `Child`"]
         target: Client,
+        #[doc(hidden)]
+        #[deprecated = "this is always `Parent`"]
         caller: Client,
     },
     #[non_exhaustive]
     CreatePtyFailed,
     #[non_exhaustive]
-    BadPtyFd(RawFd),
-    #[non_exhaustive]
     CreateChildFailed,
     #[non_exhaustive]
     SignalSetupFailed,
     #[non_exhaustive]
-    ChildCommFailed,
+    ChildCommFailed(ChildCommFailed),
     #[non_exhaustive]
     ChildSetupFailed,
     #[non_exhaustive]
@@ -86,6 +115,10 @@ pub enum ErrorKind {
     UnexpectedChildStatus(WaitStatus),
     #[non_exhaustive]
     ReceivedSignal(Signal),
+    #[doc(hidden)]
+    #[deprecated = "never used"]
+    #[non_exhaustive]
+    BadPtyFd(RawFd),
 }
 
 use ErrorKind::*;
@@ -121,25 +154,27 @@ impl Display for ErrorKind {
             }
             GetSizeFailed => write!(f, "could not get terminal size"),
             SetSizeFailed {
-                target,
-                caller,
+                ..
             } => {
-                write!(f, "could not set {} terminal size", target)?;
-                if target != caller {
-                    write!(f, " from {}", caller)?;
-                }
-                Ok(())
+                write!(f, "could not set child terminal size")
             }
             CreatePtyFailed => write!(f, "could not create pseudoterminal"),
-            BadPtyFd(fd) => write!(
-                f,
-                "pseudoterminal file descriptor is too large: {}",
-                fd,
-            ),
             CreateChildFailed => write!(f, "could not create child process"),
             SignalSetupFailed => write!(f, "could not configure signals"),
-            ChildCommFailed => {
-                write!(f, "could not communicate with child process")
+            ChildCommFailed(ChildCommFailed {
+                kind,
+            }) => {
+                write!(f, "could not communicate with child process")?;
+                match kind {
+                    ChildCommFailedKind::Unspecified => {}
+                    ChildCommFailedKind::BadPollFlags(flags) => {
+                        write!(f, ": bad poll() flags: {:?}", flags)?;
+                    }
+                    ChildCommFailedKind::SignalReadError => {
+                        write!(f, ": error reading from signal pipe")?;
+                    }
+                }
+                Ok(())
             }
             ChildSetupFailed => write!(f, "could not set up child process"),
             ChildOpenTtyFailed => {
@@ -164,6 +199,8 @@ impl Display for ErrorKind {
             ReceivedSignal(signal) => {
                 write!(f, "process received signal: {}", signal)
             }
+            #[allow(deprecated)]
+            BadPtyFd(_) => write!(f, "deprecated error kind: {:?}", self),
         }
     }
 }
@@ -202,7 +239,7 @@ pub struct Error {
 }
 
 impl Error {
-    pub(crate) fn with_kind(kind: impl Into<ErrorKind>) -> Self {
+    pub(crate) fn from_kind(kind: impl Into<ErrorKind>) -> Self {
         Self {
             kind: kind.into(),
             call: None,
@@ -233,13 +270,61 @@ impl std::error::Error for Error {}
 
 macro_rules! ignore_error {
     ($expr:expr) => {
-        match $expr {
-            Ok(_) => {}
-            Err(e) => {
-                if cfg!(debug_assertions) {
-                    eprintln!("{}:{}: {:?}", file!(), line!(), e);
-                }
+        if let Err(e) = $expr {
+            if cfg!(debug_assertions) {
+                eprintln!("{}:{}: {:?}", file!(), line!(), e);
             }
+        }
+    };
+}
+
+pub(crate) struct ErrorWrapper<T>(pub T);
+
+impl ErrorWrapper<Errno> {
+    pub fn into_raw_errno(self) -> Option<i32> {
+        Some(self.0 as _)
+    }
+}
+
+pub(crate) trait IntoRawErrno: Sized {
+    fn into_raw_errno(self) -> Option<i32> {
+        None
+    }
+}
+
+impl<T> IntoRawErrno for T {}
+
+/// Async-signal-safe version of `ignore_error`. Prints only limited error
+/// details to maintain signal safety.
+macro_rules! ignore_error_sigsafe {
+    ($expr:expr) => {
+        loop {
+            let e = match $expr {
+                Err(e) if cfg!(debug_assertions) => e,
+                _ => break,
+            };
+
+            use ::nix::libc::STDERR_FILENO as FD;
+            use ::nix::unistd::write;
+            use $crate::error::ErrorWrapper;
+            #[allow(unused_imports)]
+            use $crate::error::IntoRawErrno;
+            use $crate::utils::format_u32;
+
+            let _ = write(FD, b"error at ");
+            let _ = write(FD, file!().as_bytes());
+            let _ = write(FD, b":");
+
+            const LINE: ([u8; 10], usize) = format_u32(line!());
+            let _ = write(FD, &LINE.0[LINE.1..]);
+
+            if let Some(errno) = ErrorWrapper(e).into_raw_errno() {
+                let _ = write(FD, b": os error ");
+                let (buf, i) = format_u32(errno as u32);
+                let _ = write(FD, &buf[i..]);
+            }
+            let _ = write(FD, b"\n");
+            break;
         }
     };
 }

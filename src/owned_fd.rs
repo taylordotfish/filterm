@@ -28,7 +28,7 @@ impl OwnedFd {
         Self(fd)
     }
 
-    pub fn get(&self) -> RawFd {
+    pub fn raw(&self) -> RawFd {
         self.0
     }
 
@@ -37,12 +37,12 @@ impl OwnedFd {
     }
 
     pub fn release(self) -> RawFd {
-        ManuallyDrop::new(self).get()
+        ManuallyDrop::new(self).raw()
     }
 }
 
 impl Drop for OwnedFd {
     fn drop(&mut self) {
-        let _ = close(self.get());
+        let _ = close(self.raw());
     }
 }

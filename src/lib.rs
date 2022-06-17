@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021 taylor.fish <contact@taylor.fish>
+ * Copyright (C) 2021-2022 taylor.fish <contact@taylor.fish>
  *
  * This file is part of Filterm.
  *
@@ -22,7 +22,7 @@
 //! like ANSI escape sequences that get sent from the child.
 //!
 //! The main way of using Filterm is to define a custom filter by implementing
-//! the [`FilterHooks`] trait, and then call [`run`].
+//! the [`Filter`] trait, and then call [`run`].
 //!
 //! For an example of Filterm in use, see
 //! [Monoterm](https://github.com/taylordotfish/monoterm).
@@ -32,42 +32,42 @@
 //!
 //! Filterm has been tested on GNU/Linux. It may work on other Unix-like
 //! operating systems, as it avoids using Linux- and GNU-specific
-//! functionality.
+//! functionality and sticks to POSIX whenever possible.
 
 use std::cell::Cell;
 use std::convert::{Infallible, TryFrom};
-use std::ffi::{CString, OsString};
+use std::env;
+use std::ffi::{CStr, CString, OsString};
 use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
-use std::os::raw::c_int;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::os::unix::io::RawFd;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 pub use nix;
 use nix::errno::Errno;
-use nix::fcntl::{fcntl, open, FcntlArg, FdFlag, OFlag};
-use nix::libc;
-use nix::pty::{grantpt, posix_openpt, ptsname, unlockpt, PtyMaster};
-use nix::sys::select::{pselect, FdSet};
-use nix::sys::signal::{kill, raise, sigprocmask, SigSet, SigmaskHow, Signal};
+use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+use nix::libc::{self, c_char, c_int};
+use nix::poll::{poll, PollFd, PollFlags};
+use nix::pty::openpty;
+use nix::sys::signal::{kill, raise, SigSet, Signal};
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler};
-use nix::sys::stat::Mode;
 use nix::sys::termios::{tcgetattr, tcsetattr, SetArg, Termios};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{close, dup2, execvp, fork, isatty, read, setsid, write};
+use nix::unistd::{close, dup2, fork, isatty, read, setsid, write};
 use nix::unistd::{pipe, ForkResult, Pid};
-use nix::NixPath;
 
 mod cfmakeraw;
 #[macro_use]
 pub mod error;
-#[allow(dead_code)]
 mod owned_fd;
+mod utils;
 
 use cfmakeraw::cfmakeraw;
 pub use error::Error;
 use error::{CallName::Ioctl, Client::*, ErrorKind::*};
+use error::{ChildCommFailed, ChildCommFailedKind};
 use owned_fd::OwnedFd;
 
 fn tiocgwinsz(fd: RawFd) -> nix::Result<libc::winsize> {
@@ -85,61 +85,62 @@ fn tiocswinsz(fd: RawFd, size: &libc::winsize) -> nix::Result<()> {
 thread_local! {
     static ORIG_TERM_ATTRS: Cell<Option<Termios>> = Cell::default();
     static CHILD_PID: Cell<Option<Pid>> = Cell::default();
-    static ORIG_TERMINATE_ACTIONS: [Cell<Option<SigAction>>; 3] =
+    static ORIG_SIGNAL_ACTIONS: [Cell<Option<SigAction>>; 5] =
         Default::default();
-    static ORIG_SIGWINCH_ACTION: Cell<Option<SigAction>> = Cell::default();
-    static ORIG_SIGCHLD_ACTION: Cell<Option<SigAction>> = Cell::default();
-    static ORIG_SIGMASK: Cell<Option<SigSet>> = Cell::default();
 }
 
-const TERMINATE_SIGNALS: [Signal; 3] =
-    [Signal::SIGHUP, Signal::SIGINT, Signal::SIGTERM];
+const SIGNALS: [Signal; 5] = [
+    Signal::SIGWINCH,
+    Signal::SIGCHLD,
+    Signal::SIGHUP,
+    Signal::SIGINT,
+    Signal::SIGTERM,
+];
 
-static PENDING_TERMINATE: AtomicI32 = AtomicI32::new(i32::MIN);
+const SIGWINCH_INDEX: usize = 0;
+const SIGCHLD_INDEX: usize = 1;
+const TERMINATE_INDICES: [usize; 3] = [2, 3, 4];
 
-fn install_terminate_handler() -> Result<(), Error> {
-    extern "C" fn handle_terminate(signal: c_int) {
-        #[allow(clippy::useless_conversion)]
-        let signal = i32::try_from(signal).unwrap();
-        assert!(signal != i32::MIN);
-        PENDING_TERMINATE.store(signal, Ordering::Relaxed);
+static SIGNAL_RECEIVED: [AtomicBool; 5] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
+
+/// This must always contain either null, or a valid, aligned pointer to an
+/// initialized `RawFd`.
+static SIGNAL_FD: AtomicPtr<RawFd> = AtomicPtr::new(ptr::null_mut());
+
+extern "C" fn handle_signal(signal: c_int) {
+    let fd = SIGNAL_FD.load(Ordering::Relaxed);
+    if fd.is_null() {
+        let _ = write(libc::STDERR_FILENO, b"signal fd is null\n");
+        unsafe {
+            libc::abort();
+        }
     }
 
-    let action = SigAction::new(
-        SigHandler::Handler(handle_terminate),
-        SaFlags::empty(),
-        SigSet::empty(),
-    );
-
-    ORIG_TERMINATE_ACTIONS.with(|actions| {
-        IntoIterator::into_iter(TERMINATE_SIGNALS).zip(actions).try_for_each(
-            |(signal, orig)| {
-                unsafe { sigaction(signal, &action) }
-                    .map_err(SignalSetupFailed.with("sigaction"))
-                    .map(|a| orig.set(Some(a)))
-            },
-        )
-    })
-}
-
-fn handle_pending_terminate() -> Result<(), Error> {
-    match PENDING_TERMINATE.swap(i32::MIN, Ordering::Relaxed) {
-        i32::MIN => Ok(()),
-        signal => Err(Error::with_kind(ReceivedSignal(
-            Signal::try_from(signal).expect("invalid signal"),
-        ))),
+    if let Some(i) = SIGNALS.iter().position(|s| signal == *s as _) {
+        SIGNAL_RECEIVED[i].store(true, Ordering::Relaxed);
+        // SAFETY: `fd` is never modified after signal handlers are installed.
+        ignore_error_sigsafe!(write(unsafe { *fd }, &[signal as u8]));
+        return;
     }
+
+    let _ = write(libc::STDERR_FILENO, b"unexpected signal: ");
+    let (buf, i) = utils::format_c_uint(signal as _);
+    let _ = write(libc::STDERR_FILENO, &buf[i..]);
+    let _ = write(libc::STDERR_FILENO, b"\n");
 }
 
 #[repr(u32)]
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ChildErrorKind {
     Setsid = 1,
-    Sigprocmask = 2,
-    OpenTty = 3,
-    Tcsetattr = 4,
-    Tiocswinsz = 5,
-    Execvp = 6,
+    Tcsetattr = 2,
+    Execv = 3,
 }
 
 struct ChildError(ChildErrorKind, Errno);
@@ -150,25 +151,16 @@ impl From<ChildError> for Error {
         Self {
             kind: match e.0 {
                 Kind::Setsid => ChildSetupFailed,
-                Kind::Sigprocmask => ChildSetupFailed,
-                Kind::OpenTty => ChildOpenTtyFailed,
                 Kind::Tcsetattr => SetAttrFailed {
                     target: Child,
                     caller: Child,
                 },
-                Kind::Tiocswinsz => SetSizeFailed {
-                    target: Child,
-                    caller: Child,
-                },
-                Kind::Execvp => ChildExecFailed,
+                Kind::Execv => ChildExecFailed,
             },
             call: match e.0 {
                 Kind::Setsid => Some("setsid".into()),
-                Kind::Sigprocmask => Some("sigprocmask".into()),
-                Kind::OpenTty => Some("open".into()),
                 Kind::Tcsetattr => Some("tcsetattr".into()),
-                Kind::Tiocswinsz => Some(Ioctl("TIOCSWINSZ")),
-                Kind::Execvp => Some("execvp".into()),
+                Kind::Execv => Some("execv".into()),
             },
             errno: Some(e.1),
         }
@@ -187,46 +179,50 @@ impl TryFrom<u64> for ChildError {
     fn try_from(n: u64) -> Result<Self, Self::Error> {
         use ChildErrorKind::*;
         let errno = Errno::from_i32(n as u32 as i32);
-        let kind = match (n >> 32) as u32 {
+        let kind = match n {
             1 => Setsid,
-            2 => Sigprocmask,
-            3 => OpenTty,
-            4 => Tcsetattr,
-            5 => Tiocswinsz,
-            6 => Execvp,
+            2 => Tcsetattr,
+            3 => Execv,
             _ => return Err(n),
         };
         Ok(Self(kind, errno))
     }
 }
 
-fn child_exec<Arg, Path>(
-    args: impl IntoIterator<Item = Arg>,
-    tty_name: &Path,
+fn child_exec(
+    paths: &[impl AsRef<CStr>],
+    args: &[impl AsRef<CStr>],
+    buf: &mut [*const c_char],
+    tty_fd: RawFd,
     attrs: &Termios,
-    winsize: &libc::winsize,
-) -> Result<Infallible, ChildError>
-where
-    Arg: Into<OsString>,
-    Path: NixPath + ?Sized,
-{
+) -> Result<Infallible, ChildError> {
     use ChildError as Error;
     use ChildErrorKind::*;
 
-    sigprocmask(
-        SigmaskHow::SIG_SETMASK,
-        Some(&ORIG_SIGMASK.with(|mask| mask.take()).unwrap()),
-        None,
-    )
-    .map_err(|e| Error(Sigprocmask, e))?;
+    if paths.is_empty() {
+        let _ = write(libc::STDERR_FILENO, b"child_exec: empty `paths`\n");
+        unsafe {
+            libc::abort();
+        }
+    }
+
+    if let Some(ptr) = buf.get_mut(args.len()) {
+        *ptr = ptr::null();
+    } else {
+        let _ = write(libc::STDERR_FILENO, b"child_exec: bad `buf` length\n");
+        unsafe {
+            libc::abort();
+        }
+    }
+
+    for (arg, ptr) in args.iter().zip(&mut *buf) {
+        *ptr = arg.as_ref().as_ptr();
+    }
 
     setsid().map_err(|e| Error(Setsid, e))?;
     for fd in 0..=2 {
         let _ = close(fd);
     }
-
-    let tty_fd = open(tty_name, OFlag::O_RDWR, Mode::empty())
-        .map_err(|e| Error(OpenTty, e))?;
 
     for fd in 0..=2 {
         let _ = dup2(tty_fd, fd);
@@ -235,16 +231,22 @@ where
     if tty_fd > 2 {
         let _ = close(tty_fd);
     }
-
     tcsetattr(0, SetArg::TCSANOW, attrs).map_err(|e| Error(Tcsetattr, e))?;
-    tiocswinsz(0, winsize).map_err(|e| Error(Tiocswinsz, e))?;
 
-    let args: Vec<_> = args
-        .into_iter()
-        .map(|a| CString::new(a.into().into_vec()).unwrap())
-        .collect();
-    execvp(&args[0], &args).map_err(|e| Error(Execvp, e))?;
-    unreachable!();
+    for path in paths {
+        // Note: we're using the raw `libc` function because the Nix wrapper
+        // isn't async-signal-safe.
+        unsafe {
+            libc::execv(path.as_ref().as_ptr(), buf.as_ptr());
+        }
+        use Errno::*;
+        match Errno::last() {
+            EACCES | EINVAL | ELOOP | ENAMETOOLONG | ENOENT | ENOTDIR
+            | ENOEXEC => {}
+            _ => break,
+        }
+    }
+    Err(Error(Execv, Errno::last()))
 }
 
 fn read_child_error(fd: RawFd) -> Result<Option<ChildError>, Error> {
@@ -252,7 +254,7 @@ fn read_child_error(fd: RawFd) -> Result<Option<ChildError>, Error> {
     let mut nread = 0;
     while nread < buf.len() {
         nread += match read(fd, &mut buf[nread..])
-            .map_err(ChildCommFailed.with("read"))?
+            .map_err(ChildCommFailed(ChildCommFailed::new()).with("read"))?
         {
             0 => return Ok(None),
             n => n,
@@ -265,15 +267,15 @@ fn read_child_error(fd: RawFd) -> Result<Option<ChildError>, Error> {
     ))
 }
 
-struct Buffers<const N: usize> {
-    pub input: [u8; N],
+struct Buffers {
+    pub input: Box<[u8]>,
     pub output: Vec<u8>,
 }
 
-fn handle_stdin_ready<Fh: FilterHooks, const N: usize>(
-    pty: &PtyMaster,
-    filter: &mut Fh,
-    bufs: &mut Buffers<N>,
+fn handle_stdin_ready<F: Filter>(
+    pty_fd: RawFd,
+    filter: &mut F,
+    bufs: &mut Buffers,
 ) -> Result<ControlFlow<()>, Error> {
     let nread = match read(0, &mut bufs.input) {
         Ok(0) => {
@@ -293,7 +295,7 @@ fn handle_stdin_ready<Fh: FilterHooks, const N: usize>(
         |c| filter.on_parent_data(&inbuf[..nread], |data| c.add(data)),
         |chunk| {
             if !write_err {
-                write_err = write(pty.as_raw_fd(), chunk).is_err();
+                write_err = write(pty_fd, chunk).is_err();
             }
         },
     );
@@ -305,12 +307,12 @@ fn handle_stdin_ready<Fh: FilterHooks, const N: usize>(
     })
 }
 
-fn handle_pty_ready<Fh: FilterHooks, const N: usize>(
-    pty: &PtyMaster,
-    filter: &mut Fh,
-    bufs: &mut Buffers<N>,
+fn handle_pty_ready<F: Filter>(
+    pty_fd: RawFd,
+    filter: &mut F,
+    bufs: &mut Buffers,
 ) -> Result<ControlFlow<()>, Error> {
-    let nread = match read(pty.as_raw_fd(), &mut bufs.input) {
+    let nread = match read(pty_fd, &mut bufs.input) {
         Ok(0) | Err(_) => return Ok(ControlFlow::Break(())),
         Ok(n) => n,
     };
@@ -331,38 +333,38 @@ fn handle_pty_ready<Fh: FilterHooks, const N: usize>(
         .map_or(Ok(ControlFlow::Continue(())), Err)
 }
 
-static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn handle_sigwinch(_: c_int) {
-    SIGWINCH_RECEIVED.store(true, Ordering::Relaxed);
-}
-
-fn update_child_winsize(pty: &PtyMaster) -> Result<(), Error> {
-    if !SIGWINCH_RECEIVED.swap(false, Ordering::Relaxed) {
+fn update_child_winsize(pty_fd: RawFd, pid: Pid) -> Result<(), Error> {
+    if !SIGNAL_RECEIVED[SIGWINCH_INDEX].swap(false, Ordering::Relaxed) {
         return Ok(());
     }
 
     let size = tiocgwinsz(0).map_err(GetSizeFailed.with("tiocgwinsz"))?;
-    tiocswinsz(pty.as_raw_fd(), &size).map_err(
+    tiocswinsz(pty_fd, &size).map_err(
         SetSizeFailed {
             target: Child,
             caller: Parent,
         }
         .with(Ioctl("TIOCSWINSZ")),
     )?;
+
+    ignore_error!(kill(pid, Signal::SIGWINCH));
     Ok(())
 }
 
-static SIGCHLD_RECEIVED: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn handle_sigchld(_: c_int) {
-    SIGCHLD_RECEIVED.store(true, Ordering::Relaxed);
+fn handle_pending_terminate() -> Result<(), Error> {
+    for i in TERMINATE_INDICES {
+        if SIGNAL_RECEIVED[i].swap(false, Ordering::Relaxed) {
+            return Err(Error::from_kind(ReceivedSignal(SIGNALS[i])));
+        }
+    }
+    Ok(())
 }
 
 fn try_child_wait(pid: Pid) -> Result<Option<Exit>, Error> {
-    if !SIGCHLD_RECEIVED.swap(false, Ordering::Relaxed) {
+    if !SIGNAL_RECEIVED[SIGCHLD_INDEX].swap(false, Ordering::Relaxed) {
         return Ok(None);
     }
+
     match waitpid(pid, Some(WaitPidFlag::WNOHANG))
         .map_err(GetChildStatusFailed.with("waitpid"))?
     {
@@ -377,10 +379,21 @@ fn try_child_wait(pid: Pid) -> Result<Option<Exit>, Error> {
     }
 }
 
+fn read_all_nonblocking(fd: RawFd) -> Result<(), Errno> {
+    let mut buf = [0; 64];
+    loop {
+        match read(fd, &mut buf) {
+            Ok(0) | Err(Errno::EAGAIN) => return Ok(()),
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// A trait for filtering data to and from a child terminal.
 ///
 /// An object implementing this trait should be passed to [`run`].
-pub trait FilterHooks {
+pub trait Filter {
     /// Called when data from the child terminal is received.
     ///
     /// `parent_write` should be called (any number of times) to forward this
@@ -406,10 +419,17 @@ pub trait FilterHooks {
     }
 }
 
-/// An implementation of [`FilterHooks`] that simply uses the default methods.
+#[doc(hidden)]
+#[deprecated = "use `Filter` instead"]
+pub use Filter as FilterHooks;
+
+#[doc(hidden)]
+#[deprecated = "using this with `run` is equivalent to spawning a normal \
+    process"]
 pub struct DefaultFilterHooks;
 
-impl FilterHooks for DefaultFilterHooks {}
+#[allow(deprecated)]
+impl Filter for DefaultFilterHooks {}
 
 /// For use with [`chunked`]; see its documentation for more information.
 struct Chunked<'a, T, OutFn> {
@@ -474,49 +494,61 @@ pub enum Exit {
     Signal(Signal),
 }
 
-fn run_impl<Args, Fh>(args: Args, filter: &mut Fh) -> Result<Exit, Error>
-where
-    Args: IntoIterator<Item = OsString>,
-    Fh: FilterHooks,
-{
+fn run_impl(
+    paths: &[impl AsRef<CStr>],
+    args: &[impl AsRef<CStr>],
+    filter: &mut impl Filter,
+) -> Result<Exit, Error> {
     if !isatty(0).unwrap_or(false) {
-        return Err(Error::with_kind(NotATty));
+        return Err(Error::from_kind(NotATty));
     }
 
     let term_attrs = tcgetattr(0).map_err(GetAttrFailed.with("tcgetattr"))?;
     let winsize =
         tiocgwinsz(0).map_err(GetSizeFailed.with(Ioctl("TIOCGWINSZ")))?;
-    let pty = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY)
-        .map_err(CreatePtyFailed.with("posix_openpt"))?;
 
-    let pty_fd = pty.as_raw_fd();
-    // As of nix v0.23.0, `FdSet::insert` and `FdSet::remove` cause UB if
-    // passed a file descriptor greater than or equal to `libc::FD_SETSIZE`,
-    // so it's important we check the file descriptor manually.
-    if !usize::try_from(pty_fd).map_or(false, |fd| fd < libc::FD_SETSIZE) {
-        return Err(Error::with_kind(BadPtyFd(pty_fd)));
+    // We have to use `openpty` instead of `posix_openpt` because `ptsname`
+    // isn't thread-safe (and is thus unsafe to call).
+    let pty = openpty(None, None).map_err(CreatePtyFailed.with("openpty"))?;
+    let pty_parent = OwnedFd::new(pty.master);
+    let pty_child = OwnedFd::new(pty.slave);
+
+    let (sig_read, sig_write) =
+        pipe().map_err(SignalSetupFailed.with("pipe"))?;
+
+    fcntl(sig_read, FcntlArg::F_GETFL)
+        .map(|flags| OFlag::from_bits(flags).unwrap_or(OFlag::O_RDONLY))
+        .and_then(|flags| {
+            fcntl(sig_read, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
+        })
+        .and_then(|_| fcntl(sig_write, FcntlArg::F_GETFL))
+        .map(|flags| OFlag::from_bits(flags).unwrap_or(OFlag::O_WRONLY))
+        .and_then(|flags| {
+            fcntl(sig_write, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
+        })
+        .map_err(SignalSetupFailed.with("fcntl"))?;
+
+    // Although extremely unlikely, we store a pointer to the descriptor
+    // instead of the descriptor itself to avoid the case of some esoteric
+    // platform where `c_int` is larger than all of the available atomics.
+    SIGNAL_FD.store(Box::into_raw(Box::new(sig_write)), Ordering::Relaxed);
+
+    for (i, signal) in IntoIterator::into_iter(SIGNALS).enumerate() {
+        let orig = unsafe {
+            sigaction(
+                signal,
+                &SigAction::new(
+                    SigHandler::Handler(handle_signal),
+                    SaFlags::SA_RESTART,
+                    SigSet::empty(),
+                ),
+            )
+        }
+        .map_err(SignalSetupFailed.with("sigaction"))?;
+        ORIG_SIGNAL_ACTIONS.with(|actions| {
+            actions[i].set(Some(orig));
+        });
     }
-
-    grantpt(&pty).map_err(CreatePtyFailed.with("grantpt"))?;
-    unlockpt(&pty).map_err(CreatePtyFailed.with("unlockpt"))?;
-    let child_tty_name =
-        unsafe { ptsname(&pty) }.map_err(CreatePtyFailed.with("ptsname"))?;
-
-    let mut orig_sigmask = SigSet::empty();
-    sigprocmask(
-        SigmaskHow::SIG_BLOCK,
-        Some(&{
-            let mut set = SigSet::empty();
-            IntoIterator::into_iter([Signal::SIGWINCH, Signal::SIGCHLD])
-                .chain(TERMINATE_SIGNALS)
-                .for_each(|s| set.add(s));
-            set
-        }),
-        Some(&mut orig_sigmask),
-    )
-    .map_err(SignalSetupFailed.with("sigprocmask"))?;
-    ORIG_SIGMASK.with(|mask| mask.set(Some(orig_sigmask)));
-    install_terminate_handler()?;
 
     let mut new_attrs = term_attrs.clone();
     cfmakeraw(&mut new_attrs);
@@ -527,28 +559,44 @@ where
         }
         .with("tcsetattr"),
     )?;
+    tiocswinsz(pty_parent.raw(), &winsize).map_err(
+        SetSizeFailed {
+            // `pty_parent` is still the child process's terminal.
+            target: Child,
+            caller: Parent,
+        }
+        .with(Ioctl("TIOCSWINSZ")),
+    )?;
     ORIG_TERM_ATTRS.with(|attrs| attrs.set(Some(term_attrs.clone())));
 
-    let (read_fd, write_fd) = pipe().map_err(ChildCommFailed.with("pipe"))?;
+    let (read_fd, write_fd) = pipe()
+        .map_err(ChildCommFailed(ChildCommFailed::new()).with("pipe"))?;
     let [read_fd, write_fd] = [read_fd, write_fd].map(OwnedFd::new);
+
+    let mut buf = Vec::new();
+    buf.resize(args.len() + 1, ptr::null());
+
     let fork = unsafe { fork() }.map_err(CreateChildFailed.with("fork"))?;
     let child_pid = match fork {
         ForkResult::Child => {
-            drop(pty);
-            ignore_error!(read_fd.close());
-            ignore_error!(fcntl(
-                write_fd.get(),
+            drop(pty_parent);
+            ignore_error_sigsafe!(read_fd.close());
+            ignore_error_sigsafe!(fcntl(
+                write_fd.raw(),
                 FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)
             ));
-            let result = child_exec(
+            let result: Result<Infallible, _> = child_exec(
+                paths,
                 args,
-                child_tty_name.as_str(),
+                &mut buf,
+                pty_child.raw(),
                 &term_attrs,
-                &winsize,
             );
             let err = u64::from(result.unwrap_err()).to_be_bytes();
-            ignore_error!(write(write_fd.get(), &err));
-            unsafe { libc::_exit(1) };
+            ignore_error_sigsafe!(write(write_fd.raw(), &err));
+            unsafe {
+                libc::_exit(libc::EXIT_FAILURE);
+            }
         }
         ForkResult::Parent {
             child,
@@ -556,74 +604,70 @@ where
     };
 
     CHILD_PID.with(|pid| pid.set(Some(child_pid)));
+    ignore_error!(pty_child.close());
     ignore_error!(write_fd.close());
-    if let Some(e) = read_child_error(read_fd.get())? {
+    if let Some(e) = read_child_error(read_fd.raw())? {
         return Err(Error::from(e));
     }
     ignore_error!(read_fd.close());
 
-    let orig_sigwinch = unsafe {
-        sigaction(
-            Signal::SIGWINCH,
-            &SigAction::new(
-                SigHandler::Handler(handle_sigwinch),
-                SaFlags::SA_RESTART,
-                SigSet::empty(),
-            ),
-        )
-    }
-    .map_err(SignalSetupFailed.with("sigaction"))?;
-    ORIG_SIGWINCH_ACTION.with(|act| act.set(Some(orig_sigwinch)));
-
-    let orig_sigchld = unsafe {
-        sigaction(
-            Signal::SIGCHLD,
-            &SigAction::new(
-                SigHandler::Handler(handle_sigchld),
-                SaFlags::SA_RESTART,
-                SigSet::empty(),
-            ),
-        )
-    }
-    .map_err(SignalSetupFailed.with("sigaction"))?;
-    ORIG_SIGCHLD_ACTION.with(|act| act.set(Some(orig_sigchld)));
-
     const BUFFER_SIZE: usize = 1024;
     let mut bufs = Buffers {
-        input: [0; BUFFER_SIZE],
+        input: {
+            let mut buf = Vec::new();
+            buf.resize(BUFFER_SIZE, 0);
+            buf.into_boxed_slice()
+        },
         output: Vec::with_capacity(BUFFER_SIZE),
     };
 
-    loop {
-        let mut fds = FdSet::new();
-        fds.insert(0);
-        fds.insert(pty_fd);
+    let mut poll_fds = [sig_read, 0, pty_parent.raw()]
+        .map(|fd| PollFd::new(fd, PollFlags::POLLIN));
 
-        match pselect(pty_fd + 1, &mut fds, None, None, None, &orig_sigmask) {
-            Err(Errno::EINTR) => {
+    loop {
+        const EMPTY: PollFlags = PollFlags::empty();
+
+        match poll(&mut poll_fds, -1) {
+            Err(Errno::EINTR) => continue,
+            r => {
+                r.map_err(ChildCommFailed(ChildCommFailed::new()).with("poll"))
+            }
+        }?;
+
+        match poll_fds[0].revents() {
+            Some(EMPTY) => {}
+            Some(PollFlags::POLLIN) => {
+                read_all_nonblocking(sig_read).map_err(
+                    ChildCommFailed(
+                        ChildCommFailedKind::SignalReadError.into(),
+                    )
+                    .with("read"),
+                )?;
                 handle_pending_terminate()?;
                 if let Some(exit) = try_child_wait(child_pid)? {
                     return Ok(exit);
                 }
-                update_child_winsize(&pty)?;
-                continue;
+                update_child_winsize(pty_parent.raw(), child_pid)?;
             }
-            r => {
-                r.map_err(ChildCommFailed.with("pselect"))?;
+            Some(flags) => {
+                return Err(Error::from_kind(ChildCommFailed(
+                    ChildCommFailedKind::BadPollFlags(flags).into(),
+                )));
             }
+            None => {}
         }
 
-        if fds.contains(0) {
+        if poll_fds[1].revents() != Some(PollFlags::empty()) {
             if let ControlFlow::Break(_) =
-                handle_stdin_ready(&pty, filter, &mut bufs)?
+                handle_stdin_ready(pty_parent.raw(), filter, &mut bufs)?
             {
                 break;
             }
         }
 
-        if fds.contains(pty_fd) {
+        if poll_fds[2].revents() != Some(PollFlags::empty()) {
             if let ControlFlow::Break(_) =
-                handle_pty_ready(&pty, filter, &mut bufs)?
+                handle_pty_ready(pty_parent.raw(), filter, &mut bufs)?
             {
                 break;
             }
@@ -645,57 +689,77 @@ where
 
 /// Runs the command specified by `args` with the given filter.
 ///
-/// The arguments in `args` are passed to `execvp()`.
-pub fn run<Args, Arg, Fh>(args: Args, filter: &mut Fh) -> Result<Exit, Error>
+/// This function behaves as if it passes `args` to `execvp()`, but it
+/// internally uses `execv()` as the former is not async-signal-safe.
+///
+/// # Notes
+///
+/// * This function cannot be called from multiple threads concurrently.
+/// * This function calls [`ptsname`], which is not thread-safe. Thus, you must
+///   not call [`ptsname`] while this function is running.
+pub fn run<Args, Arg, F>(args: Args, filter: &mut F) -> Result<Exit, Error>
 where
     Args: IntoIterator<Item = Arg>,
     Arg: Into<OsString>,
-    Fh: FilterHooks,
+    F: Filter,
 {
-    static HAS_RUN: AtomicBool = AtomicBool::new(false);
-    thread_local! {
-        static HAS_RUN_ON_THIS_THREAD: Cell<bool> = Cell::new(false);
+    let args: Vec<_> = args
+        .into_iter()
+        .map(|a| CString::new(a.into().into_vec()).unwrap())
+        .collect();
+    let first =
+        args.first().ok_or_else(|| Error::from_kind(ChildExecFailed))?;
+
+    let paths = if first.as_bytes().contains(&b'/') {
+        Vec::new()
+    } else {
+        // Strictly speaking, we should use `confstr(_CS_PATH, ...)` in the
+        // case where `PATH` is unset, but that function is not exported by
+        // `libc`.
+        env::split_paths(
+            &env::var_os("PATH").unwrap_or_else(|| "/bin:/usr/bin".into()),
+        )
+        .map(|path| {
+            let mut path = path.into_os_string().into_vec();
+            path.reserve_exact(first.as_bytes().len() + 1);
+            path.push(b'/');
+            path.extend_from_slice(first.as_bytes());
+            CString::new(path).unwrap()
+        })
+        .collect()
+    };
+
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    if RUNNING.swap(true, Ordering::Acquire) {
+        panic!("filterm is already running on another thread");
     }
 
-    if !HAS_RUN_ON_THIS_THREAD.with(|b| b.get()) {
-        assert!(
-            !HAS_RUN.swap(true, Ordering::Relaxed),
-            "`run` may not be called from multiple threads",
-        );
-        HAS_RUN_ON_THIS_THREAD.with(|b| b.set(true));
-    }
+    let result = run_impl(
+        if paths.is_empty() {
+            &args[..1]
+        } else {
+            &paths
+        },
+        &args,
+        filter,
+    );
 
-    let result = run_impl(args.into_iter().map(|a| a.into()), filter);
-    if let Some(pid) = CHILD_PID.with(|pid| pid.take()) {
+    if let Some(pid) = CHILD_PID.with(Cell::take) {
         if result.is_err() {
             ignore_error!(kill(pid, Signal::SIGHUP));
         }
     }
-    if let Some(attrs) = ORIG_TERM_ATTRS.with(|attrs| attrs.take()) {
+
+    if let Some(attrs) = ORIG_TERM_ATTRS.with(Cell::take) {
         ignore_error!(tcsetattr(0, SetArg::TCSANOW, &attrs));
     }
-    if let Some(action) = ORIG_SIGWINCH_ACTION.with(|a| a.take()) {
-        ignore_error!(unsafe { sigaction(Signal::SIGWINCH, &action) });
-    }
-    if let Some(action) = ORIG_SIGCHLD_ACTION.with(|a| a.take()) {
-        ignore_error!(unsafe { sigaction(Signal::SIGCHLD, &action) });
-    }
-    ORIG_TERMINATE_ACTIONS.with(|actions| {
-        actions
-            .iter()
-            .zip(TERMINATE_SIGNALS)
-            .filter_map(|(a, s)| a.take().map(|a| (a, s)))
-            .for_each(|(action, signal)| {
-                ignore_error!(unsafe { sigaction(signal, &action) });
-            });
-    });
-    if let Some(mask) = ORIG_SIGMASK.with(|mask| mask.take()) {
-        ignore_error!(sigprocmask(SigmaskHow::SIG_SETMASK, Some(&mask), None));
-    }
+
     if let Err(e) = handle_pending_terminate().as_ref().and(result.as_ref()) {
         if let ReceivedSignal(signal) = e.kind {
             ignore_error!(raise(signal));
         }
     }
+
+    RUNNING.store(false, Ordering::Release);
     result
 }
