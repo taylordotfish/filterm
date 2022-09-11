@@ -179,7 +179,7 @@ impl TryFrom<u64> for ChildError {
     fn try_from(n: u64) -> Result<Self, Self::Error> {
         use ChildErrorKind::*;
         let errno = Errno::from_i32(n as u32 as i32);
-        let kind = match n {
+        let kind = match n >> 32 {
             1 => Setsid,
             2 => Tcsetattr,
             3 => Execv,
