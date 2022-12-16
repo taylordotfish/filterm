@@ -701,6 +701,14 @@ where
     Arg: Into<OsString>,
     F: Filter,
 {
+    ORIG_TERM_ATTRS.with(|attrs| attrs.set(None));
+    CHILD_PID.with(|pid| pid.set(None));
+    ORIG_SIGNAL_ACTIONS.with(|actions| {
+        for action in actions {
+            action.set(None);
+        }
+    });
+
     let args: Vec<_> = args
         .into_iter()
         .map(|a| CString::new(a.into().into_vec()).unwrap())
@@ -751,6 +759,16 @@ where
     if let Some(attrs) = ORIG_TERM_ATTRS.with(Cell::take) {
         ignore_error!(tcsetattr(0, SetArg::TCSANOW, &attrs));
     }
+
+    ORIG_SIGNAL_ACTIONS.with(|actions| {
+        for (i, action) in actions.iter().enumerate() {
+            if let Some(ref action) = action.take() {
+                unsafe {
+                    sigaction(SIGNALS[i], action).expect("sigaction() failed");
+                }
+            }
+        }
+    });
 
     if let Err(e) = handle_pending_terminate().as_ref().and(result.as_ref()) {
         if let ReceivedSignal(signal) = e.kind {
