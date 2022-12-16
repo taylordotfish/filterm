@@ -41,8 +41,8 @@ use std::ffi::{CStr, CString, OsString};
 use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::io::RawFd;
-use std::ptr;
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 pub use nix;
@@ -61,19 +61,22 @@ use nix::unistd::{pipe, ForkResult, Pid};
 mod cfmakeraw;
 #[macro_use]
 pub mod error;
-mod owned_fd;
 mod utils;
 
 use cfmakeraw::cfmakeraw;
 pub use error::Error;
-use error::{CallName::Ioctl, Client::*, ErrorKind::*};
-use error::{ChildCommFailed, ChildCommFailedKind};
-use owned_fd::OwnedFd;
+use error::{
+    CallName::Ioctl,
+    Client::*,
+    ErrorKind::{self, *},
+};
+use error::{ChildCommFailed, ChildCommFailedKind, UnexpectedChildStatus};
 
 fn tiocgwinsz(fd: RawFd) -> nix::Result<libc::winsize> {
     nix::ioctl_read_bad!(ioctl, libc::TIOCGWINSZ, libc::winsize);
     let mut size = MaybeUninit::uninit();
     unsafe { ioctl(fd, size.as_mut_ptr()) }?;
+    // SAFETY: Initialized by `ioctl`.
     Ok(unsafe { size.assume_init() })
 }
 
@@ -101,31 +104,31 @@ const SIGWINCH_INDEX: usize = 0;
 const SIGCHLD_INDEX: usize = 1;
 const TERMINATE_INDICES: [usize; 3] = [2, 3, 4];
 
-static SIGNAL_RECEIVED: [AtomicBool; 5] = [
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-];
+#[allow(clippy::declare_interior_mutable_const)]
+const ATOMIC_FALSE: AtomicBool = AtomicBool::new(false);
+static SIGNAL_RECEIVED: [AtomicBool; 5] = [ATOMIC_FALSE; 5];
 
 /// This must always contain either null, or a valid, aligned pointer to an
 /// initialized `RawFd`.
 static SIGNAL_FD: AtomicPtr<RawFd> = AtomicPtr::new(ptr::null_mut());
 
 extern "C" fn handle_signal(signal: c_int) {
-    let fd = SIGNAL_FD.load(Ordering::Relaxed);
-    if fd.is_null() {
-        let _ = write(libc::STDERR_FILENO, b"signal fd is null\n");
-        unsafe {
-            libc::abort();
-        }
-    }
+    let fd = NonNull::new(SIGNAL_FD.load(Ordering::Relaxed)).map_or_else(
+        || {
+            let _ = write(libc::STDERR_FILENO, b"signal fd is null\n");
+            unsafe {
+                libc::abort();
+            }
+        },
+        |p| {
+            // SAFETY: Safe due to invariants of `SIGNAL_FD`.
+            *unsafe { p.as_ref() }
+        },
+    );
 
     if let Some(i) = SIGNALS.iter().position(|s| signal == *s as _) {
         SIGNAL_RECEIVED[i].store(true, Ordering::Relaxed);
-        // SAFETY: `fd` is never modified after signal handlers are installed.
-        ignore_error_sigsafe!(write(unsafe { *fd }, &[signal as u8]));
+        ignore_error_sigsafe!(write(fd, &[signal as u8]));
         return;
     }
 
@@ -133,6 +136,23 @@ extern "C" fn handle_signal(signal: c_int) {
     let (buf, i) = utils::format_c_uint(signal as _);
     let _ = write(libc::STDERR_FILENO, &buf[i..]);
     let _ = write(libc::STDERR_FILENO, b"\n");
+}
+
+fn forward_signal(index: usize) {
+    let old_action = ORIG_SIGNAL_ACTIONS.with(|actions| actions[index].get());
+    let old_action = if let Some(action) = old_action {
+        action
+    } else {
+        return;
+    };
+    let result = unsafe { sigaction(SIGNALS[index], &old_action) };
+    ignore_error!(result);
+    if let Ok(ref action) = result {
+        ignore_error!(raise(SIGNALS[index]));
+        unsafe {
+            sigaction(SIGNALS[index], action).expect("sigaction() failed");
+        }
+    }
 }
 
 #[repr(u32)]
@@ -162,7 +182,7 @@ impl From<ChildError> for Error {
                 Kind::Tcsetattr => Some("tcsetattr".into()),
                 Kind::Execv => Some("execv".into()),
             },
-            errno: Some(e.1),
+            io_error: Some(e.1.into()),
         }
     }
 }
@@ -254,7 +274,7 @@ fn read_child_error(fd: RawFd) -> Result<Option<ChildError>, Error> {
     let mut nread = 0;
     while nread < buf.len() {
         nread += match read(fd, &mut buf[nread..])
-            .map_err(ChildCommFailed(ChildCommFailed::new()).with("read"))?
+            .map_err(ErrorKind::from(ChildCommFailed::new()).with("read"))?
         {
             0 => return Ok(None),
             n => n,
@@ -282,7 +302,7 @@ fn handle_stdin_ready<F: Filter>(
             return Err(Error {
                 kind: EmptyParentRead,
                 call: Some("read".into()),
-                errno: None,
+                io_error: None,
             });
         }
         r => r.map_err(ParentReadFailed.with("read"))?,
@@ -339,22 +359,18 @@ fn update_child_winsize(pty_fd: RawFd, pid: Pid) -> Result<(), Error> {
     }
 
     let size = tiocgwinsz(0).map_err(GetSizeFailed.with("tiocgwinsz"))?;
-    tiocswinsz(pty_fd, &size).map_err(
-        SetSizeFailed {
-            target: Child,
-            caller: Parent,
-        }
-        .with(Ioctl("TIOCSWINSZ")),
-    )?;
+    tiocswinsz(pty_fd, &size)
+        .map_err(SetSizeFailed.with(Ioctl("TIOCSWINSZ")))?;
 
     ignore_error!(kill(pid, Signal::SIGWINCH));
+    forward_signal(SIGWINCH_INDEX);
     Ok(())
 }
 
 fn handle_pending_terminate() -> Result<(), Error> {
     for i in TERMINATE_INDICES {
-        if SIGNAL_RECEIVED[i].swap(false, Ordering::Relaxed) {
-            return Err(Error::from_kind(ReceivedSignal(SIGNALS[i])));
+        if SIGNAL_RECEIVED[i].load(Ordering::Relaxed) {
+            return Err(Error::from_kind(ReceivedSignal(SIGNALS[i] as _)));
         }
     }
     Ok(())
@@ -365,18 +381,26 @@ fn try_child_wait(pid: Pid) -> Result<Option<Exit>, Error> {
         return Ok(None);
     }
 
-    match waitpid(pid, Some(WaitPidFlag::WNOHANG))
+    let result = match waitpid(pid, Some(WaitPidFlag::WNOHANG))
         .map_err(GetChildStatusFailed.with("waitpid"))?
     {
         WaitStatus::Exited(_, code) => Ok(Some(Exit::Normal(code))),
         WaitStatus::Signaled(_, sig, _) => Ok(Some(Exit::Signal(sig))),
         WaitStatus::StillAlive => Ok(None),
         status => Err(Error {
-            kind: UnexpectedChildStatus(status),
+            kind: UnexpectedChildStatus::new(status).into(),
             call: Some("waitpid".into()),
-            errno: None,
+            io_error: None,
         }),
-    }
+    };
+
+    forward_signal(SIGCHLD_INDEX);
+    result
+}
+
+fn set_nonblock(fd: RawFd) -> Result<(), Errno> {
+    let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
+    fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map(|_| ())
 }
 
 fn read_all_nonblocking(fd: RawFd) -> Result<(), Errno> {
@@ -418,18 +442,6 @@ pub trait Filter {
         child_write(data);
     }
 }
-
-#[doc(hidden)]
-#[deprecated = "use `Filter` instead"]
-pub use Filter as FilterHooks;
-
-#[doc(hidden)]
-#[deprecated = "using this with `run` is equivalent to spawning a normal \
-    process"]
-pub struct DefaultFilterHooks;
-
-#[allow(deprecated)]
-impl Filter for DefaultFilterHooks {}
 
 /// For use with [`chunked`]; see its documentation for more information.
 struct Chunked<'a, T, OutFn> {
@@ -510,23 +522,16 @@ fn run_impl(
     // We have to use `openpty` instead of `posix_openpt` because `ptsname`
     // isn't thread-safe (and is thus unsafe to call).
     let pty = openpty(None, None).map_err(CreatePtyFailed.with("openpty"))?;
-    let pty_parent = OwnedFd::new(pty.master);
-    let pty_child = OwnedFd::new(pty.slave);
+    // SAFETY: PTY FDs are open, can be owned, and require only `close` for
+    // cleanup.
+    let [pty_parent, pty_child] =
+        [pty.master, pty.slave].map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
 
     let (sig_read, sig_write) =
         pipe().map_err(SignalSetupFailed.with("pipe"))?;
-
-    fcntl(sig_read, FcntlArg::F_GETFL)
-        .map(|flags| OFlag::from_bits(flags).unwrap_or(OFlag::O_RDONLY))
-        .and_then(|flags| {
-            fcntl(sig_read, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
-        })
-        .and_then(|_| fcntl(sig_write, FcntlArg::F_GETFL))
-        .map(|flags| OFlag::from_bits(flags).unwrap_or(OFlag::O_WRONLY))
-        .and_then(|flags| {
-            fcntl(sig_write, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
-        })
-        .map_err(SignalSetupFailed.with("fcntl"))?;
+    set_nonblock(sig_read)
+        .and_then(|_| set_nonblock(sig_write))
+        .map_err(SignalSetupFailed.with("fnctl"))?;
 
     // Although extremely unlikely, we store a pointer to the descriptor
     // instead of the descriptor itself to avoid the case of some esoteric
@@ -552,6 +557,7 @@ fn run_impl(
 
     let mut new_attrs = term_attrs.clone();
     cfmakeraw(&mut new_attrs);
+    ORIG_TERM_ATTRS.with(|attrs| attrs.set(Some(term_attrs.clone())));
     tcsetattr(0, SetArg::TCSANOW, &new_attrs).map_err(
         SetAttrFailed {
             target: Parent,
@@ -559,19 +565,15 @@ fn run_impl(
         }
         .with("tcsetattr"),
     )?;
-    tiocswinsz(pty_parent.raw(), &winsize).map_err(
-        SetSizeFailed {
-            // `pty_parent` is still the child process's terminal.
-            target: Child,
-            caller: Parent,
-        }
-        .with(Ioctl("TIOCSWINSZ")),
-    )?;
-    ORIG_TERM_ATTRS.with(|attrs| attrs.set(Some(term_attrs.clone())));
+    tiocswinsz(pty_parent.as_raw_fd(), &winsize)
+        .map_err(SetSizeFailed.with(Ioctl("TIOCSWINSZ")))?;
 
     let (read_fd, write_fd) = pipe()
-        .map_err(ChildCommFailed(ChildCommFailed::new()).with("pipe"))?;
-    let [read_fd, write_fd] = [read_fd, write_fd].map(OwnedFd::new);
+        .map_err(ErrorKind::from(ChildCommFailed::new()).with("pipe"))?;
+    // SAFETY: Pipe FDs are open, can be owned, and require only `close` for
+    // cleanup.
+    let [read_fd, write_fd] =
+        [read_fd, write_fd].map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
 
     let mut buf = Vec::new();
     buf.resize(args.len() + 1, ptr::null());
@@ -580,20 +582,20 @@ fn run_impl(
     let child_pid = match fork {
         ForkResult::Child => {
             drop(pty_parent);
-            ignore_error_sigsafe!(read_fd.close());
+            ignore_error_sigsafe!(close(read_fd.into_raw_fd()));
             ignore_error_sigsafe!(fcntl(
-                write_fd.raw(),
+                write_fd.as_raw_fd(),
                 FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)
             ));
             let result: Result<Infallible, _> = child_exec(
                 paths,
                 args,
                 &mut buf,
-                pty_child.raw(),
+                pty_child.as_raw_fd(),
                 &term_attrs,
             );
             let err = u64::from(result.unwrap_err()).to_be_bytes();
-            ignore_error_sigsafe!(write(write_fd.raw(), &err));
+            ignore_error_sigsafe!(write(write_fd.as_raw_fd(), &err));
             unsafe {
                 libc::_exit(libc::EXIT_FAILURE);
             }
@@ -604,12 +606,12 @@ fn run_impl(
     };
 
     CHILD_PID.with(|pid| pid.set(Some(child_pid)));
-    ignore_error!(pty_child.close());
-    ignore_error!(write_fd.close());
-    if let Some(e) = read_child_error(read_fd.raw())? {
+    ignore_error!(close(pty_child.into_raw_fd()));
+    ignore_error!(close(write_fd.into_raw_fd()));
+    if let Some(e) = read_child_error(read_fd.as_raw_fd())? {
         return Err(Error::from(e));
     }
-    ignore_error!(read_fd.close());
+    ignore_error!(close(read_fd.into_raw_fd()));
 
     const BUFFER_SIZE: usize = 1024;
     let mut bufs = Buffers {
@@ -621,7 +623,7 @@ fn run_impl(
         output: Vec::with_capacity(BUFFER_SIZE),
     };
 
-    let mut poll_fds = [sig_read, 0, pty_parent.raw()]
+    let mut poll_fds = [sig_read, 0, pty_parent.as_raw_fd()]
         .map(|fd| PollFd::new(fd, PollFlags::POLLIN));
 
     loop {
@@ -630,7 +632,7 @@ fn run_impl(
         match poll(&mut poll_fds, -1) {
             Err(Errno::EINTR) => continue,
             r => {
-                r.map_err(ChildCommFailed(ChildCommFailed::new()).with("poll"))
+                r.map_err(ErrorKind::from(ChildCommFailed::new()).with("poll"))
             }
         }?;
 
@@ -647,7 +649,7 @@ fn run_impl(
                 if let Some(exit) = try_child_wait(child_pid)? {
                     return Ok(exit);
                 }
-                update_child_winsize(pty_parent.raw(), child_pid)?;
+                update_child_winsize(pty_parent.as_raw_fd(), child_pid)?;
             }
             Some(flags) => {
                 return Err(Error::from_kind(ChildCommFailed(
@@ -659,7 +661,7 @@ fn run_impl(
 
         if poll_fds[1].revents() != Some(PollFlags::empty()) {
             if let ControlFlow::Break(_) =
-                handle_stdin_ready(pty_parent.raw(), filter, &mut bufs)?
+                handle_stdin_ready(pty_parent.as_raw_fd(), filter, &mut bufs)?
             {
                 break;
             }
@@ -667,7 +669,7 @@ fn run_impl(
 
         if poll_fds[2].revents() != Some(PollFlags::empty()) {
             if let ControlFlow::Break(_) =
-                handle_pty_ready(pty_parent.raw(), filter, &mut bufs)?
+                handle_pty_ready(pty_parent.as_raw_fd(), filter, &mut bufs)?
             {
                 break;
             }
@@ -680,9 +682,9 @@ fn run_impl(
         WaitStatus::Exited(_, code) => Ok(Exit::Normal(code)),
         WaitStatus::Signaled(_, sig, _) => Ok(Exit::Signal(sig)),
         status => Err(Error {
-            kind: UnexpectedChildStatus(status),
+            kind: UnexpectedChildStatus::new(status).into(),
             call: Some("waitpid".into()),
-            errno: None,
+            io_error: None,
         }),
     }
 }
@@ -694,13 +696,22 @@ fn run_impl(
 ///
 /// # Panics
 ///
-/// This function will panic if called from multiple threads concurrently.
+/// This function will panic if called multiple times concurrently, either from
+/// multiple threads or by a function in `filter`.
 pub fn run<Args, Arg, F>(args: Args, filter: &mut F) -> Result<Exit, Error>
 where
     Args: IntoIterator<Item = Arg>,
     Arg: Into<OsString>,
     F: Filter,
 {
+    ORIG_TERM_ATTRS.with(|attrs| attrs.set(None));
+    CHILD_PID.with(|pid| pid.set(None));
+    ORIG_SIGNAL_ACTIONS.with(|actions| {
+        for action in actions {
+            action.set(None);
+        }
+    });
+
     let args: Vec<_> = args
         .into_iter()
         .map(|a| CString::new(a.into().into_vec()).unwrap())
@@ -728,9 +739,10 @@ where
     };
 
     static RUNNING: AtomicBool = AtomicBool::new(false);
-    if RUNNING.swap(true, Ordering::Acquire) {
-        panic!("filterm is already running on another thread");
-    }
+    assert!(
+        !RUNNING.swap(true, Ordering::Acquire),
+        "filterm is already running",
+    );
 
     let result = run_impl(
         if paths.is_empty() {
@@ -752,9 +764,19 @@ where
         ignore_error!(tcsetattr(0, SetArg::TCSANOW, &attrs));
     }
 
-    if let Err(e) = handle_pending_terminate().as_ref().and(result.as_ref()) {
-        if let ReceivedSignal(signal) = e.kind {
-            ignore_error!(raise(signal));
+    ORIG_SIGNAL_ACTIONS.with(|actions| {
+        for (i, action) in actions.iter().enumerate() {
+            if let Some(ref action) = action.take() {
+                unsafe {
+                    sigaction(SIGNALS[i], action).expect("sigaction() failed");
+                }
+            }
+        }
+    });
+
+    for (i, received) in SIGNAL_RECEIVED.iter().enumerate() {
+        if received.swap(false, Ordering::Relaxed) {
+            ignore_error!(raise(SIGNALS[i]));
         }
     }
 

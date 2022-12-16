@@ -27,13 +27,14 @@ macro_rules! define_format_uint {
         /// formatted number begins.
         $vis const fn $name(
             mut n: $type,
-        ) -> ([u8; ::core::mem::size_of::<$type>() * 8 / 3], usize) {
-            let mut buf = [0; ::core::mem::size_of::<$type>() * 8 / 3];
-            let mut i = buf.len();
-            if n == 0 {
-                i -= 1;
-                buf[i] = b'0';
-            }
+        ) -> (
+            [u8; (::core::mem::size_of::<$type>() * 8 * 7 + 22) / 23],
+            usize,
+        ) {
+            let mut buf = [
+                b'0'; (::core::mem::size_of::<$type>() * 8 * 7 + 22) / 23
+            ];
+            let mut i = buf.len() - (n == 0) as usize;
             while n > 0 {
                 i -= 1;
                 buf[i] = b'0' + (n % 10) as u8;

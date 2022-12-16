@@ -18,5 +18,5 @@ Filterm has been tested on GNU/Linux. It may work on other Unix-like
 operating systems, as it avoids using Linux- and GNU-specific
 functionality and sticks to POSIX whenever possible.
 
-[`Filter`]: https://docs.rs/filterm/latest/filterm/trait.Filter.html
-[`run`]: https://docs.rs/filterm/latest/filterm/fn.run.html
+[`Filter`]: https://docs.rs/filterm/0.2/filterm/trait.Filter.html
+[`run`]: https://docs.rs/filterm/0.2/filterm/fn.run.html
