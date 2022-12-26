@@ -45,7 +45,6 @@ use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-pub use nix;
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
 use nix::libc::{self, c_char, c_int};
@@ -385,7 +384,7 @@ fn try_child_wait(pid: Pid) -> Result<Option<Exit>, Error> {
         .map_err(GetChildStatusFailed.with("waitpid"))?
     {
         WaitStatus::Exited(_, code) => Ok(Some(Exit::Normal(code))),
-        WaitStatus::Signaled(_, sig, _) => Ok(Some(Exit::Signal(sig))),
+        WaitStatus::Signaled(_, sig, _) => Ok(Some(Exit::Signal(sig as _))),
         WaitStatus::StillAlive => Ok(None),
         status => Err(Error {
             kind: UnexpectedChildStatus::new(status).into(),
@@ -502,8 +501,10 @@ where
 /// Returned by [`run`] when the child process exits.
 #[non_exhaustive]
 pub enum Exit {
+    /// The child process exited normally with the given exit code.
     Normal(i32),
-    Signal(Signal),
+    /// The child process exited with a signal.
+    Signal(i32),
 }
 
 fn run_impl(
@@ -680,7 +681,7 @@ fn run_impl(
         .map_err(GetChildStatusFailed.with("waitpid"))?
     {
         WaitStatus::Exited(_, code) => Ok(Exit::Normal(code)),
-        WaitStatus::Signaled(_, sig, _) => Ok(Exit::Signal(sig)),
+        WaitStatus::Signaled(_, sig, _) => Ok(Exit::Signal(sig as _)),
         status => Err(Error {
             kind: UnexpectedChildStatus::new(status).into(),
             call: Some("waitpid".into()),

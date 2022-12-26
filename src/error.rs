@@ -17,16 +17,22 @@
  * along with Filterm. If not, see <https://www.gnu.org/licenses/>.
  */
 
+//! Error types.
+
 use nix::errno::Errno;
 use nix::poll::PollFlags;
 use nix::sys::wait::WaitStatus;
 use std::fmt::{self, Display, Formatter};
 use std::io;
 
+/// Indicates whether an error occurred in the parent or child
+/// process/terminal.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Client {
+    /// The parent process/terminal.
     Parent,
+    /// The child process/terminal.
     Child,
 }
 
@@ -39,6 +45,7 @@ impl Display for Client {
     }
 }
 
+/// Error information for [`ErrorKind::ChildCommFailed`].
 #[derive(Debug)]
 pub struct ChildCommFailed {
     pub(crate) kind: ChildCommFailedKind,
@@ -71,6 +78,7 @@ impl From<ChildCommFailedKind> for ChildCommFailed {
     }
 }
 
+/// Error information for [`ErrorKind::UnexpectedChildStatus`].
 #[derive(Debug)]
 pub struct UnexpectedChildStatus {
     pub(crate) status: WaitStatus,
@@ -90,46 +98,67 @@ impl From<UnexpectedChildStatus> for ErrorKind {
     }
 }
 
+/// The kind of error that occurred.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum ErrorKind {
+    /// Stdin is not a TTY.
     #[non_exhaustive]
     NotATty,
+    /// Could not get terminal attributes.
     #[non_exhaustive]
     GetAttrFailed,
+    /// Could not set terminal attributes.
     #[non_exhaustive]
     SetAttrFailed {
+        /// The client that tried to set terminal attributes.
         target: Client,
+        /// The client whose terminal attributes were attempted to be set.
         caller: Client,
     },
+    /// Could not get terminal size.
     #[non_exhaustive]
     GetSizeFailed,
+    /// Could not set terminal size.
     #[non_exhaustive]
     SetSizeFailed,
+    /// Could not create a pseudoterminal.
     #[non_exhaustive]
     CreatePtyFailed,
+    /// Could not create the child process.
     #[non_exhaustive]
     CreateChildFailed,
+    /// Could not set up signal handlers.
     #[non_exhaustive]
     SignalSetupFailed,
+    /// Could not communicate with the child process.
     #[non_exhaustive]
     ChildCommFailed(ChildCommFailed),
+    /// Could not set up the child process.
     #[non_exhaustive]
     ChildSetupFailed,
+    /// Could not open the terminal in the child process.
     #[non_exhaustive]
     ChildOpenTtyFailed,
+    /// Could not execute the requested process.
     #[non_exhaustive]
     ChildExecFailed,
+    /// Received no data when trying to read from the parent terminal.
     #[non_exhaustive]
     EmptyParentRead,
+    /// Could not read from the parent terminal.
     #[non_exhaustive]
     ParentReadFailed,
+    /// Could not write to the parent terminal.
     #[non_exhaustive]
     ParentWriteFailed,
+    /// Could not get the status of the child process.
     #[non_exhaustive]
     GetChildStatusFailed,
+    /// Received an unexpected status from the child process.
     #[non_exhaustive]
     UnexpectedChildStatus(UnexpectedChildStatus),
+    /// Parent process received a termination signal.
     #[non_exhaustive]
     ReceivedSignal(i32),
 }
@@ -214,11 +243,14 @@ impl Display for ErrorKind {
     }
 }
 
+/// The name of the function or `ioctl()` request that produced an error.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum CallName {
+    /// The name of the function that produced an error.
     #[non_exhaustive]
     Func(&'static str),
+    /// The name of the `ioctl()` request that produced an error.
     #[non_exhaustive]
     Ioctl(&'static str),
 }
@@ -242,8 +274,12 @@ impl From<&'static str> for CallName {
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct Error {
+    /// The kind of error that occurred.
     pub kind: ErrorKind,
+    /// The name of the function or `ioctl()` request (if any) that produced
+    /// an error.
     pub call: Option<CallName>,
+    /// The underlying system error (if any) that occurred.
     pub io_error: Option<io::Error>,
 }
 
