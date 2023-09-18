@@ -1,6 +1,6 @@
 [package]
 name = "filterm"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2018"
 rust-version = "1.63"
 description = "Filter terminal data to and from a child process"

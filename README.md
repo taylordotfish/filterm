@@ -1,30 +1,30 @@
 Filterm
 =======
 
-Filterm lets you run a child process while piping all terminal data to
-and from the child through a custom filter. This lets you modify things
-like ANSI escape sequences that get sent from the child.
+Filterm lets you run a child process while piping all terminal data to and
+from the child through a custom filter. This lets you modify things like
+ANSI escape sequences that get sent from the child.
 
 The main way of using Filterm is to define a custom filter by implementing
 the [`Filter`] trait, and then call [`run`].
 
-For an example of Filterm in use, see
-[Monoterm](https://github.com/taylordotfish/monoterm).
+For an example of Filterm in use, see [Monoterm].
 
 Platform support
 ----------------
 
 Filterm has been tested on GNU/Linux. It may work on other Unix-like
-operating systems, as it avoids using Linux- and GNU-specific
-functionality and sticks to POSIX whenever possible.
+operating systems, as it avoids using Linux- and GNU-specific functionality
+and sticks to POSIX whenever possible.
 
-[`Filter`]: https://docs.rs/filterm/0.2/filterm/trait.Filter.html
-[`run`]: https://docs.rs/filterm/0.2/filterm/fn.run.html
+[Monoterm]: https://github.com/taylordotfish/monoterm
+[`Filter`]: https://docs.rs/filterm/0.4/filterm/trait.Filter.html
+[`run`]: https://docs.rs/filterm/0.4/filterm/fn.run.html
 
 Documentation
 -------------
 
-[Documentation is available on docs.rs.](https://docs.rs/filterm)
+[Documentation is available on docs.rs.](https://docs.rs/filterm/0.4)
 
 License
 -------
