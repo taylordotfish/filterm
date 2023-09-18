@@ -1,6 +1,6 @@
 [package]
 name = "filterm"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2018"
 rust-version = "1.63"
 description = "Filter terminal data to and from a child process"
@@ -14,3 +14,8 @@ keywords = ["terminal", "filter", "unix", "linux"]
 version = "0.26"
 default-features = false
 features = ["fs", "ioctl", "poll", "process", "signal", "term"]
+
+[dependencies.atomic-int]
+version = "0.1"
+default-features = false
+features = ["c_int", "signal"]

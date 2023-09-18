@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 taylor.fish <contact@taylor.fish>
+ * Copyright (C) 2021-2023 taylor.fish <contact@taylor.fish>
  *
  * This file is part of Filterm.
  *
@@ -42,9 +42,10 @@ use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use atomic_int::AtomicCInt;
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
 use nix::libc::{self, c_char, c_int};
@@ -106,25 +107,10 @@ const TERMINATE_INDICES: [usize; 3] = [2, 3, 4];
 #[allow(clippy::declare_interior_mutable_const)]
 const ATOMIC_FALSE: AtomicBool = AtomicBool::new(false);
 static SIGNAL_RECEIVED: [AtomicBool; 5] = [ATOMIC_FALSE; 5];
-
-/// This must always contain either null, or a valid, aligned pointer to an
-/// initialized `RawFd`.
-static SIGNAL_FD: AtomicPtr<RawFd> = AtomicPtr::new(ptr::null_mut());
+static SIGNAL_FD: AtomicCInt = AtomicCInt::new(0);
 
 extern "C" fn handle_signal(signal: c_int) {
-    let fd = NonNull::new(SIGNAL_FD.load(Ordering::Relaxed)).map_or_else(
-        || {
-            let _ = write(libc::STDERR_FILENO, b"signal fd is null\n");
-            unsafe {
-                libc::abort();
-            }
-        },
-        |p| {
-            // SAFETY: Safe due to invariants of `SIGNAL_FD`.
-            *unsafe { p.as_ref() }
-        },
-    );
-
+    let fd = SIGNAL_FD.load(Ordering::Relaxed);
     if let Some(i) = SIGNALS.iter().position(|s| signal == *s as _) {
         SIGNAL_RECEIVED[i].store(true, Ordering::Relaxed);
         ignore_error_sigsafe!(write(fd, &[signal as u8]));
@@ -533,11 +519,7 @@ fn run_impl(
     set_nonblock(sig_read)
         .and_then(|_| set_nonblock(sig_write))
         .map_err(SignalSetupFailed.with("fnctl"))?;
-
-    // Although extremely unlikely, we store a pointer to the descriptor
-    // instead of the descriptor itself to avoid the case of some esoteric
-    // platform where `c_int` is larger than all of the available atomics.
-    SIGNAL_FD.store(Box::into_raw(Box::new(sig_write)), Ordering::Relaxed);
+    SIGNAL_FD.store(sig_write, Ordering::Relaxed);
 
     for (i, signal) in IntoIterator::into_iter(SIGNALS).enumerate() {
         let orig = unsafe {
@@ -616,11 +598,7 @@ fn run_impl(
 
     const BUFFER_SIZE: usize = 1024;
     let mut bufs = Buffers {
-        input: {
-            let mut buf = Vec::new();
-            buf.resize(BUFFER_SIZE, 0);
-            buf.into_boxed_slice()
-        },
+        input: vec![0; BUFFER_SIZE].into_boxed_slice(),
         output: Vec::with_capacity(BUFFER_SIZE),
     };
 
