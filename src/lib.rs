@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2023 taylor.fish <contact@taylor.fish>
+ * Copyright (C) 2021-2024 taylor.fish <contact@taylor.fish>
  *
  * This file is part of Filterm.
  *
@@ -39,25 +39,26 @@ use std::cell::Cell;
 use std::convert::{Infallible, TryFrom};
 use std::env;
 use std::ffi::{CStr, CString, OsString};
+use std::io;
 use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, RawFd};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use atomic_int::AtomicCInt;
 use nix::errno::Errno;
-use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::libc::{self, c_char, c_int};
-use nix::poll::{poll, PollFd, PollFlags};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::pty::openpty;
-use nix::sys::signal::{kill, raise, SigSet, Signal};
-use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler};
-use nix::sys::termios::{tcgetattr, tcsetattr, SetArg, Termios};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, sigaction};
+use nix::sys::signal::{SigSet, Signal, kill, raise};
+use nix::sys::termios::{SetArg, Termios, tcgetattr, tcsetattr};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::unistd::{ForkResult, Pid, pipe};
 use nix::unistd::{close, dup2, fork, isatty, read, setsid, write};
-use nix::unistd::{pipe, ForkResult, Pid};
 
 mod cfmakeraw;
 #[macro_use]
@@ -111,17 +112,20 @@ static SIGNAL_RECEIVED: [AtomicBool; 5] = [ATOMIC_FALSE; 5];
 static SIGNAL_FD: AtomicCInt = AtomicCInt::new(0);
 
 extern "C" fn handle_signal(signal: c_int) {
-    let fd = SIGNAL_FD.load(Ordering::Relaxed);
+    let raw = SIGNAL_FD.load(Ordering::Relaxed);
+    let fd = unsafe { BorrowedFd::borrow_raw(raw) };
     if let Some(i) = SIGNALS.iter().position(|s| signal == *s as _) {
         SIGNAL_RECEIVED[i].store(true, Ordering::Relaxed);
         ignore_error_sigsafe!(write(fd, &[signal as u8]));
         return;
     }
 
-    let _ = write(libc::STDERR_FILENO, b"unexpected signal: ");
+    let stderr = io::stderr();
+    let stderr = stderr.as_fd();
+    let _ = write(stderr, b"unexpected signal: ");
     let (buf, i) = utils::format_c_uint(signal as _);
-    let _ = write(libc::STDERR_FILENO, &buf[i..]);
-    let _ = write(libc::STDERR_FILENO, b"\n");
+    let _ = write(stderr, &buf[i..]);
+    let _ = write(stderr, b"\n");
 }
 
 fn forward_signal(index: usize) {
@@ -184,7 +188,7 @@ impl TryFrom<u64> for ChildError {
 
     fn try_from(n: u64) -> Result<Self, Self::Error> {
         use ChildErrorKind::*;
-        let errno = Errno::from_i32(n as u32 as i32);
+        let errno = Errno::from_raw(n as u32 as i32);
         let kind = match n >> 32 {
             1 => Setsid,
             2 => Tcsetattr,
@@ -206,7 +210,7 @@ fn child_exec(
     use ChildErrorKind::*;
 
     if paths.is_empty() {
-        let _ = write(libc::STDERR_FILENO, b"child_exec: empty `paths`\n");
+        let _ = write(io::stderr(), b"child_exec: empty `paths`\n");
         unsafe {
             libc::abort();
         }
@@ -215,7 +219,7 @@ fn child_exec(
     if let Some(ptr) = buf.get_mut(args.len()) {
         *ptr = ptr::null();
     } else {
-        let _ = write(libc::STDERR_FILENO, b"child_exec: bad `buf` length\n");
+        let _ = write(io::stderr(), b"child_exec: bad `buf` length\n");
         unsafe {
             libc::abort();
         }
@@ -237,7 +241,8 @@ fn child_exec(
     if tty_fd > 2 {
         let _ = close(tty_fd);
     }
-    tcsetattr(0, SetArg::TCSANOW, attrs).map_err(|e| Error(Tcsetattr, e))?;
+    tcsetattr(io::stdin(), SetArg::TCSANOW, attrs)
+        .map_err(|e| Error(Tcsetattr, e))?;
 
     for path in paths {
         // Note: we're using the raw `libc` function because the Nix wrapper
@@ -279,7 +284,7 @@ struct Buffers {
 }
 
 fn handle_stdin_ready<F: Filter>(
-    pty_fd: RawFd,
+    pty_fd: BorrowedFd<'_>,
     filter: &mut F,
     bufs: &mut Buffers,
 ) -> Result<ControlFlow<()>, Error> {
@@ -314,11 +319,11 @@ fn handle_stdin_ready<F: Filter>(
 }
 
 fn handle_pty_ready<F: Filter>(
-    pty_fd: RawFd,
+    pty_fd: BorrowedFd<'_>,
     filter: &mut F,
     bufs: &mut Buffers,
 ) -> Result<ControlFlow<()>, Error> {
-    let nread = match read(pty_fd, &mut bufs.input) {
+    let nread = match read(pty_fd.as_raw_fd(), &mut bufs.input) {
         Ok(0) | Err(_) => return Ok(ControlFlow::Break(())),
         Ok(n) => n,
     };
@@ -330,7 +335,7 @@ fn handle_pty_ready<F: Filter>(
         |c| filter.on_child_data(&inbuf[..nread], |data| c.add(data)),
         |chunk| {
             if write_err.is_none() {
-                write_err = write(0, chunk).err();
+                write_err = write(io::stdin(), chunk).err();
             }
         },
     );
@@ -435,7 +440,7 @@ struct Chunked<'a, T, OutFn> {
     chunk_out: OutFn,
 }
 
-impl<'a, T, OutFn> Chunked<'a, T, OutFn>
+impl<T, OutFn> Chunked<'_, T, OutFn>
 where
     T: Copy,
     OutFn: FnMut(&[T]),
@@ -503,26 +508,24 @@ fn run_impl(
         return Err(Error::from_kind(NotATty));
     }
 
-    let term_attrs = tcgetattr(0).map_err(GetAttrFailed.with("tcgetattr"))?;
+    let term_attrs =
+        tcgetattr(io::stdin()).map_err(GetAttrFailed.with("tcgetattr"))?;
     let winsize =
         tiocgwinsz(0).map_err(GetSizeFailed.with(Ioctl("TIOCGWINSZ")))?;
 
     // We have to use `openpty` instead of `posix_openpt` because `ptsname`
     // isn't thread-safe (and is thus unsafe to call).
     let pty = openpty(None, None).map_err(CreatePtyFailed.with("openpty"))?;
-    // SAFETY: PTY FDs are open, can be owned, and require only `close` for
-    // cleanup.
-    let [pty_parent, pty_child] =
-        [pty.master, pty.slave].map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+    let [pty_parent, pty_child] = [pty.master, pty.slave];
 
     let (sig_read, sig_write) =
         pipe().map_err(SignalSetupFailed.with("pipe"))?;
-    set_nonblock(sig_read)
-        .and_then(|_| set_nonblock(sig_write))
+    set_nonblock(sig_read.as_raw_fd())
+        .and_then(|_| set_nonblock(sig_write.as_raw_fd()))
         .map_err(SignalSetupFailed.with("fnctl"))?;
-    SIGNAL_FD.store(sig_write, Ordering::Relaxed);
+    SIGNAL_FD.store(sig_write.as_raw_fd(), Ordering::Relaxed);
 
-    for (i, signal) in IntoIterator::into_iter(SIGNALS).enumerate() {
+    for (i, signal) in SIGNALS.into_iter().enumerate() {
         let orig = unsafe {
             sigaction(
                 signal,
@@ -542,7 +545,7 @@ fn run_impl(
     let mut new_attrs = term_attrs.clone();
     cfmakeraw(&mut new_attrs);
     ORIG_TERM_ATTRS.with(|attrs| attrs.set(Some(term_attrs.clone())));
-    tcsetattr(0, SetArg::TCSANOW, &new_attrs).map_err(
+    tcsetattr(io::stdin(), SetArg::TCSANOW, &new_attrs).map_err(
         SetAttrFailed {
             target: Parent,
             caller: Parent,
@@ -554,11 +557,6 @@ fn run_impl(
 
     let (read_fd, write_fd) = pipe()
         .map_err(ErrorKind::from(ChildCommFailed::new()).with("pipe"))?;
-    // SAFETY: Pipe FDs are open, can be owned, and require only `close` for
-    // cleanup.
-    let [read_fd, write_fd] =
-        [read_fd, write_fd].map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
-
     let mut buf = Vec::new();
     buf.resize(args.len() + 1, ptr::null());
 
@@ -579,7 +577,7 @@ fn run_impl(
                 &term_attrs,
             );
             let err = u64::from(result.unwrap_err()).to_be_bytes();
-            ignore_error_sigsafe!(write(write_fd.as_raw_fd(), &err));
+            ignore_error_sigsafe!(write(&write_fd, &err));
             unsafe {
                 libc::_exit(libc::EXIT_FAILURE);
             }
@@ -603,13 +601,14 @@ fn run_impl(
         output: Vec::with_capacity(BUFFER_SIZE),
     };
 
-    let mut poll_fds = [sig_read, 0, pty_parent.as_raw_fd()]
+    let stdin = io::stdin();
+    let mut poll_fds = [sig_read.as_fd(), stdin.as_fd(), pty_parent.as_fd()]
         .map(|fd| PollFd::new(fd, PollFlags::POLLIN));
 
     loop {
         const EMPTY: PollFlags = PollFlags::empty();
 
-        match poll(&mut poll_fds, -1) {
+        match poll(&mut poll_fds, PollTimeout::NONE) {
             Err(Errno::EINTR) => continue,
             r => {
                 r.map_err(ErrorKind::from(ChildCommFailed::new()).with("poll"))
@@ -619,7 +618,7 @@ fn run_impl(
         match poll_fds[0].revents() {
             Some(EMPTY) => {}
             Some(PollFlags::POLLIN) => {
-                read_all_nonblocking(sig_read).map_err(
+                read_all_nonblocking(sig_read.as_raw_fd()).map_err(
                     ChildCommFailed(
                         ChildCommFailedKind::SignalReadError.into(),
                     )
@@ -641,7 +640,7 @@ fn run_impl(
 
         if poll_fds[1].revents() != Some(PollFlags::empty()) {
             if let ControlFlow::Break(_) =
-                handle_stdin_ready(pty_parent.as_raw_fd(), filter, &mut bufs)?
+                handle_stdin_ready(pty_parent.as_fd(), filter, &mut bufs)?
             {
                 break;
             }
@@ -649,7 +648,7 @@ fn run_impl(
 
         if poll_fds[2].revents() != Some(PollFlags::empty()) {
             if let ControlFlow::Break(_) =
-                handle_pty_ready(pty_parent.as_raw_fd(), filter, &mut bufs)?
+                handle_pty_ready(pty_parent.as_fd(), filter, &mut bufs)?
             {
                 break;
             }
@@ -741,7 +740,7 @@ where
     }
 
     if let Some(attrs) = ORIG_TERM_ATTRS.with(Cell::take) {
-        ignore_error!(tcsetattr(0, SetArg::TCSANOW, &attrs));
+        ignore_error!(tcsetattr(io::stdin(), SetArg::TCSANOW, &attrs));
     }
 
     ORIG_SIGNAL_ACTIONS.with(|actions| {

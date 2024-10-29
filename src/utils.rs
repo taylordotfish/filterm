@@ -31,9 +31,8 @@ macro_rules! define_format_uint {
             [u8; (::core::mem::size_of::<$type>() * 8 * 7 + 22) / 23],
             usize,
         ) {
-            let mut buf = [
-                b'0'; (::core::mem::size_of::<$type>() * 8 * 7 + 22) / 23
-            ];
+            let mut buf =
+                [b'0'; (::core::mem::size_of::<$type>() * 8 * 7 + 22) / 23];
             let mut i = buf.len() - (n == 0) as usize;
             while n > 0 {
                 i -= 1;

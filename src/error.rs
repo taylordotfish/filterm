@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2022 taylor.fish <contact@taylor.fish>
+ * Copyright (C) 2021-2022, 2024 taylor.fish <contact@taylor.fish>
  *
  * This file is part of Filterm.
  *
@@ -299,7 +299,7 @@ impl Display for Error {
             .io_error
             .as_ref()
             .and_then(|e| e.raw_os_error())
-            .map(Errno::from_i32);
+            .map(Errno::from_raw);
         write!(f, "{}", self.kind)?;
         match (&self.call, errno) {
             (Some(call), Some(e)) => {
@@ -320,9 +320,14 @@ impl std::error::Error for Error {}
 
 macro_rules! ignore_error {
     ($expr:expr) => {
-        if let Err(ref e) = $expr {
-            if cfg!(debug_assertions) {
-                eprintln!("{}:{}: {:?}", file!(), line!(), e);
+        if let ::std::result::Result::Err(ref e) = $expr {
+            if ::std::cfg!(debug_assertions) {
+                ::std::eprintln!(
+                    "{}:{}: {:?}",
+                    ::std::file!(),
+                    ::std::line!(),
+                    e,
+                );
             }
         }
     };
@@ -347,35 +352,39 @@ impl<T> IntoRawErrno for T {}
 /// Async-signal-safe version of `ignore_error`. Prints only limited error
 /// details to maintain signal safety.
 macro_rules! ignore_error_sigsafe {
-    ($expr:expr) => {
-        loop {
-            let result = &$expr;
-            let e = match result {
-                Err(e) if cfg!(debug_assertions) => e,
-                _ => break,
-            };
-
-            use ::nix::libc::STDERR_FILENO as FD;
+    ($expr:expr) => {{
+        let result = $expr;
+        if !::std::cfg!(debug_assertions) {
+        } else if let ::std::result::Result::Err(ref e) = result {
             use ::nix::unistd::write;
+            use ::std::os::unix::io::AsFd;
             use $crate::error::ErrorWrapper;
             #[allow(unused_imports)]
             use $crate::error::IntoRawErrno;
             use $crate::utils::format_u32;
 
-            let _ = write(FD, b"error at ");
-            let _ = write(FD, file!().as_bytes());
-            let _ = write(FD, b":");
+            let stderr = ::std::io::stderr();
+            let stderr = AsFd::as_fd(&stderr);
+            let _ = write(stderr, b"error at ");
+            let _ = write(stderr, file!().as_bytes());
+            let _ = write(stderr, b":");
 
-            const LINE: ([u8; 10], usize) = format_u32(line!());
-            let _ = write(FD, &LINE.0[LINE.1..]);
+            const LINE: ([u8; 10], usize) = format_u32(::std::line!());
+            let _ = write(stderr, &LINE.0[LINE.1..]);
 
             if let Some(errno) = ErrorWrapper(e).into_raw_errno() {
-                let _ = write(FD, b": os error ");
+                let _ = write(stderr, b": os error ");
                 let (buf, i) = format_u32(errno as u32);
-                let _ = write(FD, &buf[i..]);
+                let _ = write(stderr, &buf[i..]);
             }
-            let _ = write(FD, b"\n");
-            break;
+            let _ = write(stderr, b"\n");
         }
-    };
+    }};
+}
+
+#[allow(dead_code)]
+fn allow_unused() {
+    // Suppress warnings if `IntoRawErrno` is unused, since it's part of a
+    // specialization hack.
+    ().into_raw_errno();
 }
