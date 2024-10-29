@@ -464,10 +464,8 @@ where
     }
 
     fn flush(&mut self) {
-        let mut buf = core::mem::take(self.buf);
-        (self.chunk_out)(&buf);
-        buf.clear();
-        *self.buf = buf;
+        (self.chunk_out)(self.buf);
+        self.buf.clear();
     }
 }
 
