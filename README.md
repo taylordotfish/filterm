@@ -18,13 +18,13 @@ operating systems, as it avoids using Linux- and GNU-specific functionality
 and sticks to POSIX whenever possible.
 
 [Monoterm]: https://github.com/taylordotfish/monoterm
-[`Filter`]: https://docs.rs/filterm/0.4/filterm/trait.Filter.html
-[`run`]: https://docs.rs/filterm/0.4/filterm/fn.run.html
+[`Filter`]: https://docs.rs/filterm/0.5/filterm/trait.Filter.html
+[`run`]: https://docs.rs/filterm/0.5/filterm/fn.run.html
 
 Documentation
 -------------
 
-[Documentation is available on docs.rs.](https://docs.rs/filterm/0.4)
+[Documentation is available on docs.rs.](https://docs.rs/filterm/0.5)
 
 License
 -------
