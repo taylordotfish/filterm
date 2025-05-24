@@ -42,8 +42,8 @@ use std::ffi::{CStr, CString, OsString};
 use std::io;
 use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, RawFd};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -57,8 +57,8 @@ use nix::sys::signal::{SaFlags, SigAction, SigHandler, sigaction};
 use nix::sys::signal::{SigSet, Signal, kill, raise};
 use nix::sys::termios::{SetArg, Termios, tcgetattr, tcsetattr};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Pid, pipe};
-use nix::unistd::{close, dup2, fork, isatty, read, setsid, write};
+use nix::unistd::{self, ForkResult, Pid, fork};
+use nix::unistd::{close, isatty, pipe, read, setsid, write};
 
 mod cfmakeraw;
 #[macro_use]
@@ -203,7 +203,7 @@ fn child_exec(
     paths: &[impl AsRef<CStr>],
     args: &[impl AsRef<CStr>],
     buf: &mut [*const c_char],
-    tty_fd: RawFd,
+    tty_fd: OwnedFd,
     attrs: &Termios,
 ) -> Result<Infallible, ChildError> {
     use ChildError as Error;
@@ -234,13 +234,11 @@ fn child_exec(
         let _ = close(fd);
     }
 
-    for fd in 0..=2 {
-        let _ = dup2(tty_fd, fd);
-    }
+    let _ = unistd::dup2_stdin(&tty_fd);
+    let _ = unistd::dup2_stdout(&tty_fd);
+    let _ = unistd::dup2_stderr(&tty_fd);
 
-    if tty_fd > 2 {
-        let _ = close(tty_fd);
-    }
+    drop(tty_fd);
     tcsetattr(io::stdin(), SetArg::TCSANOW, attrs)
         .map_err(|e| Error(Tcsetattr, e))?;
 
@@ -260,7 +258,7 @@ fn child_exec(
     Err(Error(Execv, Errno::last()))
 }
 
-fn read_child_error(fd: RawFd) -> Result<Option<ChildError>, Error> {
+fn read_child_error(fd: BorrowedFd<'_>) -> Result<Option<ChildError>, Error> {
     let mut buf = [0; 8];
     let mut nread = 0;
     while nread < buf.len() {
@@ -288,7 +286,7 @@ fn handle_stdin_ready<F: Filter>(
     filter: &mut F,
     bufs: &mut Buffers,
 ) -> Result<ControlFlow<()>, Error> {
-    let nread = match read(0, &mut bufs.input) {
+    let nread = match read(io::stdin(), &mut bufs.input) {
         Ok(0) => {
             return Err(Error {
                 kind: EmptyParentRead,
@@ -323,7 +321,7 @@ fn handle_pty_ready<F: Filter>(
     filter: &mut F,
     bufs: &mut Buffers,
 ) -> Result<ControlFlow<()>, Error> {
-    let nread = match read(pty_fd.as_raw_fd(), &mut bufs.input) {
+    let nread = match read(pty_fd, &mut bufs.input) {
         Ok(0) | Err(_) => return Ok(ControlFlow::Break(())),
         Ok(n) => n,
     };
@@ -389,12 +387,12 @@ fn try_child_wait(pid: Pid) -> Result<Option<Exit>, Error> {
     result
 }
 
-fn set_nonblock(fd: RawFd) -> Result<(), Errno> {
+fn set_nonblock(fd: BorrowedFd<'_>) -> Result<(), Errno> {
     let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
     fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map(|_| ())
 }
 
-fn read_all_nonblocking(fd: RawFd) -> Result<(), Errno> {
+fn read_all_nonblocking(fd: BorrowedFd<'_>) -> Result<(), Errno> {
     let mut buf = [0; 64];
     loop {
         match read(fd, &mut buf) {
@@ -502,7 +500,7 @@ fn run_impl(
     args: &[impl AsRef<CStr>],
     filter: &mut impl Filter,
 ) -> Result<Exit, Error> {
-    if !isatty(0).unwrap_or(false) {
+    if !isatty(io::stdin()).unwrap_or(false) {
         return Err(Error::from_kind(NotATty));
     }
 
@@ -518,8 +516,8 @@ fn run_impl(
 
     let (sig_read, sig_write) =
         pipe().map_err(SignalSetupFailed.with("pipe"))?;
-    set_nonblock(sig_read.as_raw_fd())
-        .and_then(|_| set_nonblock(sig_write.as_raw_fd()))
+    set_nonblock(sig_read.as_fd())
+        .and_then(|_| set_nonblock(sig_write.as_fd()))
         .map_err(SignalSetupFailed.with("fnctl"))?;
     SIGNAL_FD.store(sig_write.as_raw_fd(), Ordering::Relaxed);
 
@@ -564,16 +562,11 @@ fn run_impl(
             drop(pty_parent);
             ignore_error_sigsafe!(close(read_fd.into_raw_fd()));
             ignore_error_sigsafe!(fcntl(
-                write_fd.as_raw_fd(),
+                &write_fd,
                 FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)
             ));
-            let result: Result<Infallible, _> = child_exec(
-                paths,
-                args,
-                &mut buf,
-                pty_child.as_raw_fd(),
-                &term_attrs,
-            );
+            let result: Result<Infallible, _> =
+                child_exec(paths, args, &mut buf, pty_child, &term_attrs);
             let err = u64::from(result.unwrap_err()).to_be_bytes();
             ignore_error_sigsafe!(write(&write_fd, &err));
             unsafe {
@@ -588,7 +581,7 @@ fn run_impl(
     CHILD_PID.with(|pid| pid.set(Some(child_pid)));
     ignore_error!(close(pty_child.into_raw_fd()));
     ignore_error!(close(write_fd.into_raw_fd()));
-    if let Some(e) = read_child_error(read_fd.as_raw_fd())? {
+    if let Some(e) = read_child_error(read_fd.as_fd())? {
         return Err(Error::from(e));
     }
     ignore_error!(close(read_fd.into_raw_fd()));
@@ -616,7 +609,7 @@ fn run_impl(
         match poll_fds[0].revents() {
             Some(EMPTY) => {}
             Some(PollFlags::POLLIN) => {
-                read_all_nonblocking(sig_read.as_raw_fd()).map_err(
+                read_all_nonblocking(sig_read.as_fd()).map_err(
                     ChildCommFailed(
                         ChildCommFailedKind::SignalReadError.into(),
                     )
