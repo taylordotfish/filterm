@@ -55,17 +55,15 @@ use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::pty::openpty;
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, sigaction};
 use nix::sys::signal::{SigSet, Signal, kill, raise};
-use nix::sys::termios::{SetArg, Termios, tcgetattr, tcsetattr};
+use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{self, ForkResult, Pid, fork};
 use nix::unistd::{close, isatty, pipe, read, setsid, write};
 
-mod cfmakeraw;
 #[macro_use]
 pub mod error;
 mod utils;
 
-use cfmakeraw::cfmakeraw;
 pub use error::Error;
 use error::{
     CallName::Ioctl,
