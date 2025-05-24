@@ -28,11 +28,11 @@ macro_rules! define_format_uint {
         $vis const fn $name(
             mut n: $type,
         ) -> (
-            [u8; (::core::mem::size_of::<$type>() * 8 * 7 + 22) / 23],
+            [u8; (::core::mem::size_of::<$type>() * 8 * 7).div_ceil(23)],
             usize,
         ) {
             let mut buf =
-                [b'0'; (::core::mem::size_of::<$type>() * 8 * 7 + 22) / 23];
+                [b'0'; (::core::mem::size_of::<$type>() * 8 * 7).div_ceil(23)];
             let mut i = buf.len() - (n == 0) as usize;
             while n > 0 {
                 i -= 1;
