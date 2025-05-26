@@ -231,10 +231,6 @@ fn child_exec(
     }
 
     setsid().map_err(|e| Error(Setsid, e))?;
-    for fd in 0..=2 {
-        let _ = close(fd);
-    }
-
     let _ = unistd::dup2_stdin(&tty_fd);
     let _ = unistd::dup2_stdout(&tty_fd);
     let _ = unistd::dup2_stderr(&tty_fd);
