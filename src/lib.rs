@@ -57,19 +57,17 @@ use nix::sys::signal::{SaFlags, SigAction, SigHandler, sigaction};
 use nix::sys::signal::{SigSet, Signal, kill, raise};
 use nix::sys::termios::{SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::{self, ForkResult, Pid, fork};
-use nix::unistd::{close, isatty, pipe, read, setsid, write};
+use nix::unistd::{self, ForkResult, Pid, fork, setsid};
+use nix::unistd::{isatty, pipe, read, write};
 
 #[macro_use]
 pub mod error;
 mod utils;
 
+use error::CallName::Ioctl;
+use error::Client::*;
 pub use error::Error;
-use error::{
-    CallName::Ioctl,
-    Client::*,
-    ErrorKind::{self, *},
-};
+use error::ErrorKind::{self, *};
 use error::{ChildCommFailed, ChildCommFailedKind, UnexpectedChildStatus};
 
 fn tiocgwinsz(fd: RawFd) -> nix::Result<libc::winsize> {
@@ -83,6 +81,11 @@ fn tiocgwinsz(fd: RawFd) -> nix::Result<libc::winsize> {
 fn tiocswinsz(fd: RawFd, size: &libc::winsize) -> nix::Result<()> {
     nix::ioctl_write_ptr_bad!(ioctl, libc::TIOCSWINSZ, libc::winsize);
     unsafe { ioctl(fd, size as *const _) }.map(|_| ())
+}
+
+fn tiocsctty(fd: RawFd) -> nix::Result<()> {
+    nix::ioctl_write_int_bad!(ioctl, libc::TIOCSCTTY);
+    unsafe { ioctl(fd, 0) }.map(|_| ())
 }
 
 thread_local! {
@@ -146,12 +149,33 @@ fn forward_signal(index: usize) {
     }
 }
 
-#[repr(u32)]
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ChildErrorKind {
-    Setsid = 1,
-    Tcsetattr = 2,
-    Execv = 3,
+macro_rules! define_child_error_kind {
+    ($($variant:ident),* $(,)?) => {
+        define_child_error_kind!(impl 0, (), $($variant,)*);
+    };
+
+    (impl $len:expr, ($($variant:ident,)*),) => {
+        #[repr(u32)]
+        #[derive(Clone, Copy, Eq, PartialEq)]
+        enum ChildErrorKind {
+            $($variant,)*
+        }
+
+        impl ChildErrorKind {
+            pub const VARIANTS: [Self; $len] = [$(Self::$variant),*];
+        }
+    };
+
+    (impl $len:expr, ($($tt:tt)*), $first:ident, $($rest:tt)*) => {
+        define_child_error_kind!(impl $len + 1, ($($tt)* $first,), $($rest)*);
+    };
+}
+
+define_child_error_kind! {
+    Setsid,
+    Tiocsctty,
+    Tcsetattr,
+    Execv,
 }
 
 struct ChildError(ChildErrorKind, Errno);
@@ -162,6 +186,7 @@ impl From<ChildError> for Error {
         Self {
             kind: match e.0 {
                 Kind::Setsid => ChildSetupFailed,
+                Kind::Tiocsctty => ChildSetupFailed,
                 Kind::Tcsetattr => SetAttrFailed {
                     target: Child,
                     caller: Child,
@@ -170,6 +195,7 @@ impl From<ChildError> for Error {
             },
             call: match e.0 {
                 Kind::Setsid => Some("setsid".into()),
+                Kind::Tiocsctty => Some(Ioctl("TIOCSCTTY")),
                 Kind::Tcsetattr => Some("tcsetattr".into()),
                 Kind::Execv => Some("execv".into()),
             },
@@ -188,15 +214,11 @@ impl TryFrom<u64> for ChildError {
     type Error = u64;
 
     fn try_from(n: u64) -> Result<Self, Self::Error> {
-        use ChildErrorKind::*;
         let errno = Errno::from_raw(n as u32 as i32);
-        let kind = match n >> 32 {
-            1 => Setsid,
-            2 => Tcsetattr,
-            3 => Execv,
-            _ => return Err(n),
-        };
-        Ok(Self(kind, errno))
+        match ChildErrorKind::VARIANTS.get((n >> 32) as usize) {
+            Some(&kind) => Ok(Self(kind, errno)),
+            None => Err(n),
+        }
     }
 }
 
@@ -208,7 +230,7 @@ fn child_exec(
     attrs: &Termios,
 ) -> Result<Infallible, ChildError> {
     use ChildError as Error;
-    use ChildErrorKind::*;
+    use ChildErrorKind as Kind;
 
     if paths.is_empty() {
         let _ = write(io::stderr(), b"child_exec: empty `paths`\n");
@@ -230,14 +252,15 @@ fn child_exec(
         *ptr = arg.as_ref().as_ptr();
     }
 
-    setsid().map_err(|e| Error(Setsid, e))?;
     let _ = unistd::dup2_stdin(&tty_fd);
     let _ = unistd::dup2_stdout(&tty_fd);
     let _ = unistd::dup2_stderr(&tty_fd);
-
     drop(tty_fd);
+
+    setsid().map_err(|e| Error(Kind::Setsid, e))?;
+    tiocsctty(0).map_err(|e| Error(Kind::Tiocsctty, e))?;
     tcsetattr(io::stdin(), SetArg::TCSANOW, attrs)
-        .map_err(|e| Error(Tcsetattr, e))?;
+        .map_err(|e| Error(Kind::Tcsetattr, e))?;
 
     for path in paths {
         // Note: we're using the raw `libc` function because the Nix wrapper
@@ -252,7 +275,7 @@ fn child_exec(
             _ => break,
         }
     }
-    Err(Error(Execv, Errno::last()))
+    Err(Error(Kind::Execv, Errno::last()))
 }
 
 fn read_child_error(fd: BorrowedFd<'_>) -> Result<Option<ChildError>, Error> {
