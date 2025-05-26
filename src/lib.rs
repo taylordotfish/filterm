@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021-2024 taylor.fish <contact@taylor.fish>
+ * Copyright (C) 2021-2025 taylor.fish <contact@taylor.fish>
  *
  * This file is part of Filterm.
  *
@@ -42,7 +42,7 @@ use std::ffi::{CStr, CString, OsString};
 use std::io;
 use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -111,6 +111,9 @@ static SIGNAL_FD: AtomicCInt = AtomicCInt::new(0);
 
 extern "C" fn handle_signal(signal: c_int) {
     let raw = SIGNAL_FD.load(Ordering::Relaxed);
+    if raw == 0 {
+        return;
+    }
     let fd = unsafe { BorrowedFd::borrow_raw(raw) };
     if let Some(i) = SIGNALS.iter().position(|s| signal == *s as _) {
         SIGNAL_RECEIVED[i].store(true, Ordering::Relaxed);
@@ -557,8 +560,11 @@ fn run_impl(
     let fork = unsafe { fork() }.map_err(CreateChildFailed.with("fork"))?;
     let child_pid = match fork {
         ForkResult::Child => {
+            SIGNAL_FD.store(0, Ordering::Relaxed);
+            drop(sig_read);
+            drop(sig_write);
             drop(pty_parent);
-            ignore_error_sigsafe!(close(read_fd.into_raw_fd()));
+            drop(read_fd);
             ignore_error_sigsafe!(fcntl(
                 &write_fd,
                 FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)
@@ -577,12 +583,12 @@ fn run_impl(
     };
 
     CHILD_PID.with(|pid| pid.set(Some(child_pid)));
-    ignore_error!(close(pty_child.into_raw_fd()));
-    ignore_error!(close(write_fd.into_raw_fd()));
+    drop(pty_child);
+    drop(write_fd);
     if let Some(e) = read_child_error(read_fd.as_fd())? {
         return Err(Error::from(e));
     }
-    ignore_error!(close(read_fd.into_raw_fd()));
+    drop(read_fd);
 
     const BUFFER_SIZE: usize = 1024;
     let mut bufs = Buffers {
