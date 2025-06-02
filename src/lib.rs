@@ -88,11 +88,13 @@ fn tiocsctty(fd: RawFd) -> nix::Result<()> {
     unsafe { ioctl(fd, 0) }.map(|_| ())
 }
 
+#[allow(clippy::declare_interior_mutable_const)]
+const SIGACTION_CELL: Cell<Option<SigAction>> = Cell::new(None);
 thread_local! {
-    static ORIG_TERM_ATTRS: Cell<Option<Termios>> = Cell::default();
-    static CHILD_PID: Cell<Option<Pid>> = Cell::default();
+    static ORIG_TERM_ATTRS: Cell<Option<Termios>> = const { Cell::new(None) };
+    static CHILD_PID: Cell<Option<Pid>> = const { Cell::new(None) };
     static ORIG_SIGNAL_ACTIONS: [Cell<Option<SigAction>>; 5] =
-        Default::default();
+        const { [SIGACTION_CELL; 5] };
 }
 
 const SIGNALS: [Signal; 5] = [
