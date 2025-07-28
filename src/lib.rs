@@ -621,6 +621,7 @@ fn run_impl(
     let mut poll_fds = [sig_read.as_fd(), stdin.as_fd(), pty_parent.as_fd()]
         .map(|fd| PollFd::new(fd, PollFlags::POLLIN));
 
+    let mut child_exit = None;
     loop {
         const EMPTY: PollFlags = PollFlags::empty();
 
@@ -641,10 +642,13 @@ fn run_impl(
                     .with("read"),
                 )?;
                 handle_pending_terminate()?;
-                if let Some(exit) = try_child_wait(child_pid)? {
-                    return Ok(exit);
+                if child_exit.is_some() {
+                    // Child already exited
+                } else if let Some(exit) = try_child_wait(child_pid)? {
+                    child_exit = Some(exit);
+                } else {
+                    update_child_winsize(pty_parent.as_raw_fd(), child_pid)?;
                 }
-                update_child_winsize(pty_parent.as_raw_fd(), child_pid)?;
             }
             Some(flags) => {
                 return Err(Error::from_kind(ChildCommFailed(
@@ -669,6 +673,10 @@ fn run_impl(
                 break;
             }
         }
+    }
+
+    if let Some(exit) = child_exit {
+        return Ok(exit);
     }
 
     match waitpid(child_pid, None)
